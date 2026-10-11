@@ -7,6 +7,7 @@
 //! snapshots this type retains.
 
 use crate::combat;
+use crate::despawn;
 use crate::frame::{Body, BodyKind, Snapshot, TongueLine};
 use crate::input::{self, Claim, GestureTracker, TouchPhase, TouchSample};
 use crate::level::{Aabb, Level};
@@ -72,6 +73,10 @@ struct BodyState {
 pub struct World {
     bodies: Vec<BodyState>,
     static_terrain: Vec<crate::level::Aabb>,
+    /// The level's Kill Bound, copied from its data at construction. World-space
+    /// and nothing else: the Core Sim has no screen, so there is nothing here a
+    /// viewport could leak into. See [`crate::despawn`].
+    kill_bound: Aabb,
     hero: EntityId,
     /// The hero's Tongue slots. Indexed by slot, so a Tongue's slot and its
     /// position can never disagree.
@@ -103,6 +108,7 @@ impl World {
         let mut world = World {
             bodies: Vec::with_capacity(1 + level.enemy_spawns.len()),
             static_terrain: level.static_terrain.clone(),
+            kill_bound: level.world_bounds,
             hero: EntityId(0),
             tongues: [None; MAX_TONGUES],
             gestures: GestureTracker::new(),
@@ -231,6 +237,16 @@ impl World {
         if let Some(start) = hero_start {
             self.resolve_impacts(start);
         }
+
+        // Despawn last, and here rather than anywhere else in the tick. It is a
+        // mutation, so it must not be reachable from `body_force`, which
+        // ADR-0007's integrator evaluates twice per Sim Tick; and it reads the
+        // position motion and contact have already settled, so a body is judged
+        // on where the tick actually left it. Removing bodies before the
+        // snapshot is written is what makes a despawned body simply absent from
+        // the `Snapshot`, which is all the Shell ever needs to know about it.
+        self.bodies
+            .retain(|b| !despawn::left_kill_bound(&self.kill_bound, b.pos));
 
         self.tick += 1;
         // Rotate before writing, so `previous` is the tick before `current` and
