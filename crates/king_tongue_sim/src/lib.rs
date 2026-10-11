@@ -10,6 +10,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod frame;
+
+pub use frame::{Accumulator, Body, BodyKind, Snapshot, TongueLine, MAX_CATCHUP_TICKS};
+
 use glam::Vec2;
 
 /// Player hitbox radius. All lengths are world units; treat one unit as one metre.
