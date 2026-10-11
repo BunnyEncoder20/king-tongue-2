@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod combat;
 /// The determinism harness. Behind `test-util`, like `Level::from_ascii`, so it
 /// cannot reach a build that ships.
 #[cfg(any(test, feature = "test-util"))]
