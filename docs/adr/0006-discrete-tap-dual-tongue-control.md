@@ -8,7 +8,9 @@ Control is discrete, not continuous: a tap fires a Tongue along the tapped vecto
 
 ## Consequences
 
-This supersedes the control half of the locked boundaries and amends the premise of ADR-0003, which scoped the simulation to one point mass under one constraint. Two rope constraints on one body is an over-constrained system: when the two Anchors are separated by more than the sum of the Tongue lengths, no valid player position exists, and a position-based solver converges to a least-violation state that reads on screen as stretching or jitter. Rope constraints are inequalities, so in practice usually only one is taut, but the solver must handle the taut-taut case deliberately rather than by accident. The Tongue prototype carries this.
+This supersedes the control half of the locked boundaries.
+
+An earlier version of this ADR warned that two Tongues made the simulation over-constrained, with infeasible configurations and jitter. That warning is **withdrawn**: ADR-0003 now models the Tongue as a spring force rather than a distance constraint, and forces simply sum as vectors. Two Tongues pulling the same way double the force, opposed pulls cancel, and no configuration is invalid. The dual-Tongue mechanic costs nothing in solver complexity.
 
 The Macroquad resume behaviour changes meaning. Macroquad flips all live touches to `Ended` when the app minimizes, which previously handed the hold-to-Swing state machine a free Release. Under discrete tap control, `Ended` no longer implies Release, so attached Tongues survive a suspend and the input layer must not infer Release from touch loss.
 

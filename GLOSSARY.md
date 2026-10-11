@@ -27,8 +27,12 @@ The state of the Tongue being connected to an Anchor, holding the player at a bo
 _Avoid_: Latch, grab, hook on
 
 **Swing**:
-Pendulum motion of the player about an Anchor while Attached.
+The orbital motion that emerges while Attached, as the Tongue pulls inward and the player's tangential momentum carries across it. Nothing in the simulation models a pendulum.
 _Avoid_: Pendulum, arc, sway
+
+**Stretch**:
+The extension of a Tongue beyond its rest length, which sets how hard it pulls. Loading a Stretch by moving away from an Anchor before being slung back is a deliberate manoeuvre.
+_Avoid_: Extension, slack, recoil
 
 **Release**:
 Detaching the Tongue, converting Swing momentum into unconstrained ballistic motion.
@@ -46,6 +50,10 @@ _Avoid_: Bump, nudge, push, weak hit
 An unbroken run of Slams, counted while the player is airborne and persisting across Release and re-attach. It is a count of hits, not a score.
 _Avoid_: Streak, chain, multiplier, rally
 
+**Thrown**:
+The state of an Enemy that has lost control of its own momentum, having been pulled hard enough by a Tongue or struck hard enough to be weaponized. A Thrown Enemy destroys lesser Enemies it hits and is itself destroyed by terrain.
+_Avoid_: Vicious pull, wrecking ball, stunned, ragdoll
+
 **Enemy**:
 A body in the world that can be Slammed.
 _Avoid_: Mob, foe, NPC
@@ -56,9 +64,9 @@ _Avoid_: Mob, foe, NPC
 A discrete tap, which either fires a Tongue along the tapped vector or Releases one already attached. It is not a continuous hold.
 _Avoid_: Input, control, swipe, drag
 
-**Tolerance Cone**:
-The angular region around the Gesture's direction inside which the Tongue selects the best valid Anchor, rather than requiring a precise hit.
-_Avoid_: Aim assist, snap radius, targeting cone
+**Enemy Assist Arc**:
+The narrow region around the Gesture's direction inside which a Tongue prefers an Enemy over the terrain behind it. It never bends the aim: terrain is hit by pure ray cast along the tapped vector.
+_Avoid_: Tolerance cone, aim assist, snap radius, targeting cone
 
 ### Architecture
 
