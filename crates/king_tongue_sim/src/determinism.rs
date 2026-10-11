@@ -13,6 +13,7 @@
 //! a build that ships.
 
 use crate::frame::Snapshot;
+use crate::input::{TouchPhase, TouchSample};
 use crate::level::Level;
 use crate::world::World;
 use glam::Vec2;
@@ -26,13 +27,75 @@ use glam::Vec2;
 /// A function pointer cannot.
 pub type Script = fn(tick: u64, world: &mut World);
 
-/// The script that presses nothing.
-///
-/// It is the only script this ticket can express: there is no input path into
-/// the `World` yet, so the scene under test is a hero falling. The Gesture work
-/// replaces this with scripts that fire and Release Tongues, and the harness
-/// around it does not change.
+/// The script that presses nothing. A hero falling, and nothing else.
 pub fn no_input(_tick: u64, _world: &mut World) {}
+
+/// Taps once, aiming `aim` away from wherever the hero is at that moment.
+///
+/// The aim is relative to the hero and so to the simulation's own state, which
+/// is what makes this worth scripting: a fixed world-space point would exercise
+/// the ray cast, but an aim that tracks the hero also makes the tap's *result*
+/// depend on every tick before it, so a divergence anywhere upstream reaches
+/// the Anchor and shows up in the trace.
+fn aim(world: &mut World, id: u64, phase: TouchPhase, offset: Vec2) {
+    let Some(pos) = world.snapshot().body(world.hero_id()).map(|body| body.pos) else {
+        return;
+    };
+    world.apply_touches(&[TouchSample {
+        id,
+        phase,
+        pos: pos + offset,
+    }]);
+}
+
+/// Fires one Tongue up and to the left, then a second up and to the right,
+/// lifting each finger the frame after it lands.
+///
+/// This is the script that makes the harness mean something for the first time.
+/// Until there was an input path, the only thing it could assert was that a
+/// hero falls the same way twice, which no integrator would get wrong. Firing
+/// brings in the parts that actually could: a ray cast against terrain, slot
+/// claiming keyed on touch ids, and a spring force whose Anchor is chosen from
+/// simulation state.
+///
+/// The phases are deliberate. `Started` on one frame and `Ended` or
+/// `Cancelled` on the next is exactly how long the platform makes those
+/// visible, and the `Stationary` in between is what a finger that is still down
+/// reports, so a script that re-fired on a hold would show up here as two
+/// Tongues where one was intended.
+pub fn fires_two_tongues(tick: u64, world: &mut World) {
+    const UP_LEFT: Vec2 = Vec2::new(-2.0, 4.0);
+    const UP_RIGHT: Vec2 = Vec2::new(3.0, 2.0);
+    match tick {
+        20 => aim(world, 1, TouchPhase::Started, UP_LEFT),
+        21 => aim(world, 1, TouchPhase::Stationary, UP_LEFT),
+        22 => aim(world, 1, TouchPhase::Ended, UP_LEFT),
+        // Well after the first, so the hero is Swinging on one Tongue when the
+        // second Gesture arrives and the second Anchor depends on where that
+        // Swing had carried it.
+        90 => aim(world, 2, TouchPhase::Started, UP_RIGHT),
+        // Cancelled rather than Ended, because the platform uses it when the
+        // app loses focus and ADR-0006 forbids reading either as a Release.
+        91 => aim(world, 2, TouchPhase::Cancelled, UP_RIGHT),
+        _ => {}
+    }
+}
+
+/// Taps three times in the same frame, every frame, forever.
+///
+/// Hostile input as a script. Three concurrent ids must leave two Tongues, and
+/// hammering the same ids every frame must not re-fire them, so the whole run
+/// after the first frame has to be identical to a run that tapped once.
+pub fn hammers_three_fingers(_tick: u64, world: &mut World) {
+    for id in 1..=3 {
+        aim(
+            world,
+            id,
+            TouchPhase::Started,
+            Vec2::new(id as f32 - 2.0, 3.0),
+        );
+    }
+}
 
 /// Runs `ticks` Sim Ticks and returns every `Snapshot` along the way, starting
 /// with the one from before any tick ran.
@@ -171,11 +234,75 @@ mod tests {
         )
     }
 
+    /// The same scene, walled in, so a Gesture in any direction meets terrain
+    /// and a scripted tap always has something to Attach to.
+    fn enclosed_scene() -> Level {
+        Level::from_ascii(
+            "
+            ###########
+            #....@....#
+            #.........#
+            #..####...#
+            #.e.....e.#
+            ###########
+            ",
+        )
+    }
+
     #[test]
     fn the_same_level_and_script_produce_identical_snapshot_sequences() {
         // ADR-0002 and ADR-0007 were bought for exactly this property. Without
         // it a regression is anecdotal rather than reproducible.
         assert_deterministic(&scene(), 300, no_input);
+    }
+
+    #[test]
+    fn firing_and_attaching_produce_identical_snapshot_sequences() {
+        // The property ADR-0002 and ADR-0007 were bought for, now over the part
+        // of the simulation that could plausibly lose it: a ray cast choosing
+        // an Anchor, a slot claimed by touch id, and a spring integrated for
+        // three hundred ticks afterwards.
+        assert_deterministic(&enclosed_scene(), 300, fires_two_tongues);
+    }
+
+    #[test]
+    fn the_firing_script_really_attaches_two_tongues() {
+        // Without this the test above is vacuous. A script whose taps all
+        // missed, or whose ids never claimed a slot, would agree with itself
+        // perfectly and prove nothing about firing at all.
+        let trace = record(&enclosed_scene(), 300, fires_two_tongues);
+        assert!(
+            trace[21].tongues.len() == 1,
+            "the first Gesture must have Attached by the tick after it: {:?}",
+            trace[21].tongues
+        );
+        let last = trace.last().expect("a trace is never empty");
+        assert_eq!(
+            last.tongues.len(),
+            2,
+            "both Gestures must leave a Tongue Attached: {:?}",
+            last.tongues
+        );
+        assert!(
+            last.tongues.iter().all(|t| t.to.is_finite()),
+            "an Anchor went non-finite: {:?}",
+            last.tongues
+        );
+    }
+
+    #[test]
+    fn hostile_input_is_deterministic_too() {
+        // Three fingers hammering every frame. The slot cap, the refusal to
+        // re-fire a held id, and the ray cast all run on every single tick
+        // here, so anything order-dependent in the Gesture tracker has three
+        // hundred chances to disagree with itself.
+        assert_deterministic(&enclosed_scene(), 300, hammers_three_fingers);
+        let trace = record(&enclosed_scene(), 300, hammers_three_fingers);
+        assert_eq!(
+            trace.last().expect("a trace is never empty").tongues.len(),
+            crate::MAX_TONGUES,
+            "three fingers must leave exactly two Tongues"
+        );
     }
 
     #[test]
