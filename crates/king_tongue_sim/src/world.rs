@@ -1488,6 +1488,309 @@ mod tests {
     }
 
     #[test]
+    fn releasing_leaves_the_hero_on_the_tangent_in_ballistic_motion() {
+        // The headline of the ticket: Release converts Swing momentum into
+        // unconstrained ballistic motion. Two claims, and they are separable.
+        //
+        // The exit velocity is the tangent, which is not something the Release
+        // code arranges: it is whatever the Swing had, and the Release's job is
+        // to not touch it. So the Tongue is Released at a moment when the
+        // radial velocity has just crossed zero, which is exactly when the
+        // hero's whole velocity lies along the tangent, and the test asserts
+        // the fixture really is at a tangent before asserting anything else.
+        //
+        // The arc afterwards is then compared against the closed form
+        //
+        //     p(t) = p0 + v0*t + 0.5*g*t^2
+        //
+        // which comes from the physics and not from the code. Velocity Verlet
+        // is exact under a constant acceleration, so any residual spring force,
+        // any retraction impulse, or any velocity the Release scaled would show
+        // up here as a divergence from a prediction that knows nothing about
+        // the Tongue.
+        // A Swing, set up identically every time. Two passes over the same
+        // scene, which is sound precisely because the simulation is
+        // deterministic: the first finds which tick is the tangent and the
+        // second stops there. Reading a tick's velocity and then going back is
+        // not something the seam offers, and nothing here needs it to.
+        let swing = || {
+            let mut world = World::from_level(&open_sky(8.0));
+            let hero_id = world.hero_id();
+            let anchor = attach(&mut world, Vec2::Y);
+            lift(&mut world, 1);
+            // Across the pull, so the motion is orbital and there is a tangent
+            // to leave on at all.
+            world.place(hero_id, hero(&world).pos, Vec2::new(2.5, 0.0));
+            (world, anchor)
+        };
+
+        let radial = |w: &World, anchor: Vec2| {
+            let pos = hero(w).pos;
+            let vel = w
+                .body_velocity(w.hero_id())
+                .expect("the hero is alive")
+                .normalize_or_zero();
+            vel.dot((anchor - pos).normalize())
+        };
+
+        // The tangent is where the velocity has no component along the Tongue
+        // at all, so the flattest tick in the first orbit is the moment to
+        // leave on. Searched rather than computed, because where it falls is a
+        // property of the emergent Swing and not of a formula.
+        let (mut world, anchor) = swing();
+        let mut best = (f32::INFINITY, 0u32);
+        for tick in 1..=240u32 {
+            world.step();
+            let flatness = radial(&world, anchor).abs();
+            if flatness < best.0 {
+                best = (flatness, tick);
+            }
+        }
+        assert!(
+            best.0 < 0.01,
+            "the fixture never came within 1 percent of a tangent: {best:?}"
+        );
+
+        let (mut world, anchor) = swing();
+        let hero_id = world.hero_id();
+        for _ in 0..best.1 {
+            world.step();
+        }
+
+        let p0 = hero(&world).pos;
+        let v0 = world.body_velocity(hero_id).expect("the hero is alive");
+        let radial_dir = (anchor - p0).normalize();
+        assert!(
+            v0.normalize().dot(radial_dir).abs() < 0.01,
+            "the fixture is not at a tangent: velocity {v0:?} against radial {radial_dir:?}"
+        );
+        assert!(v0.length() > 1.0, "a tangent at rest would prove nothing");
+
+        // The second tap. Its aim is irrelevant to a Release, which is part of
+        // why a Release cannot miss.
+        tap_toward(&mut world, 2, Vec2::Y);
+
+        const TICKS: u32 = 60;
+        for _ in 0..TICKS {
+            world.step();
+        }
+        assert!(
+            world.snapshot().tongues.is_empty(),
+            "a Released Tongue must leave the Snapshot and stop being drawn"
+        );
+
+        let t = TICKS as f32 * DT;
+        let expected = p0 + v0 * t + 0.5 * GRAVITY * t * t;
+        let measured = hero(&world).pos;
+        assert!(
+            (measured - expected).length() < 1e-3,
+            "the arc was not ballistic: predicted {expected:?} from v0 {v0:?}, measured {measured:?}"
+        );
+
+        // And the momentum itself survived, rather than the position merely
+        // starting out right. Gravity is the only thing that may have changed
+        // it, which pins down both the speed and the direction.
+        let v_now = world.body_velocity(hero_id).expect("the hero is alive");
+        let expected_v = v0 + GRAVITY * t;
+        assert!(
+            (v_now - expected_v).length() < 1e-3,
+            "momentum was not preserved: predicted {expected_v:?}, measured {v_now:?}"
+        );
+    }
+
+    #[test]
+    fn releasing_cannot_miss_and_costs_nothing() {
+        // ADR-0012: "Releasing retracts the Tongue instantly with no delay",
+        // so there is no whiff case. The specific way that could go wrong here
+        // is sharing the fire path, which needs a ray hit: a Release aimed into
+        // open sky would then quietly do nothing and the player would be stuck
+        // Attached, holding a thumb at the sky.
+        let mut world = World::from_level(&open_sky(8.0));
+        attach(&mut world, Vec2::Y);
+        lift(&mut world, 1);
+        assert_eq!(world.snapshot().tongues.len(), 1);
+
+        // Straight down, where this fixture has no terrain whatsoever, so the
+        // ray a fire would cast meets nothing.
+        tap_toward(&mut world, 2, Vec2::NEG_Y);
+        world.step();
+        assert!(
+            world.snapshot().tongues.is_empty(),
+            "a Release aimed at nothing must still Release"
+        );
+
+        // Instant, meaning the very next tick and not some ticks later: there
+        // is no retraction to wait out. The tick above is the first one after
+        // the tap, and the Tongue is already gone.
+        //
+        // And no cost: the slot is immediately usable again, so Releasing does
+        // not spend a Tongue.
+        lift(&mut world, 2);
+        let anchor = attach(&mut world, Vec2::Y);
+        assert_eq!(
+            anchor,
+            Vec2::new(0.0, 9.5),
+            "the Released slot must be free to fire again at once"
+        );
+    }
+
+    #[test]
+    fn a_one_frame_ended_or_cancelled_is_not_missed() {
+        // The platform fact from the #2 research: `Ended` and `Cancelled` are
+        // visible for exactly one frame. There is no later chance to see them,
+        // so a `World` that looked at them after claiming, or only on a frame
+        // it also stepped, would silently never free the slot's ownership.
+        //
+        // That failure is invisible in every #12 test, because a finger that
+        // kept its slot forever still left its Tongue Attached and still drew
+        // correctly. It becomes visible only now: ownership is what decides
+        // which slot the next tap lands on, so a missed `Ended` sends the
+        // Release to the wrong slot and fires a second Tongue instead.
+        for phase in [TouchPhase::Ended, TouchPhase::Cancelled] {
+            let mut world = World::from_level(&room());
+            attach(&mut world, Vec2::new(0.0, 5.0));
+
+            // Shown for exactly one frame, then never again, and on a frame
+            // with no Sim Tick of its own.
+            world.apply_touches(&[TouchSample {
+                id: 1,
+                phase,
+                pos: Vec2::ZERO,
+            }]);
+
+            tap_toward(&mut world, 2, Vec2::new(0.0, 5.0));
+            world.step();
+            assert!(
+                world.snapshot().tongues.is_empty(),
+                "a one-frame {phase:?} was missed, so the next tap fired instead of \
+                 Releasing: {:?}",
+                world.snapshot().tongues
+            );
+        }
+    }
+
+    #[test]
+    fn a_longer_stretch_at_attach_returns_far_more_speed() {
+        // The skill expression of the whole control scheme, and the ticket #8
+        // prototype's headline measurement:
+        //
+        //     attach distance | Stretch | return speed | gain
+        //                   1 |    0.00 |         6.96 | 1.00x
+        //                   4 |    3.00 |        18.81 | 2.70x
+        //                  16 |   15.00 |        88.48 | 12.71x
+        //
+        // Reproduced as an ordering plus an analytic check rather than by
+        // matching those three numbers. The two spring-dominated rows are
+        // compared against the closed form instead, which is an independent
+        // source of truth: all the Stretch's stored energy becomes kinetic, so
+        //
+        //     0.5*k*s^2 = 0.5*m*v^2   ->   v = s*sqrt(k/m)
+        //
+        // giving 18.97 and 94.87 against the prototype's 18.81 and 88.48. A
+        // damped spring can only ever return less than it stored, never more,
+        // which is the bound asserted below.
+        //
+        // The `1` row is deliberately not held to a number. Its Stretch is
+        // zero, so nothing is stored and the prototype's 6.96 is entirely an
+        // artifact of how far its harness let the hero fall first. What it is
+        // held to is its place in the ordering, which is the claim that
+        // matters: loading a Stretch is what returns speed.
+        let k = DEFAULT_PULL_STRENGTH;
+
+        /// A tall wall whose right face is at `x = 0`, and nothing else. The
+        /// hero Attaches horizontally, so the pull is perpendicular to gravity
+        /// and the return is the spring's alone.
+        fn wall_at_origin(distance: f32) -> Level {
+            let level = Level {
+                world_bounds: Aabb::new(Vec2::ZERO, Vec2::splat(4_000.0)),
+                static_terrain: vec![Aabb::new(Vec2::new(-500.0, 0.0), Vec2::new(500.0, 1_000.0))],
+                player_spawn: Vec2::new(distance, 0.0),
+                enemy_spawns: vec![],
+            };
+            level.validate().expect("fixture must be a valid level");
+            level
+        }
+
+        // The fastest the hero travels after Attaching at `distance`, which is
+        // the speed the slingshot returned.
+        let returned = |distance: f32| {
+            let mut world = World::from_level(&wall_at_origin(distance));
+            let hero_id = world.hero_id();
+            let anchor = attach(&mut world, Vec2::NEG_X);
+            assert_eq!(
+                anchor,
+                Vec2::new(0.0, 0.0),
+                "the Tongue must Attach to the wall at the hero's own height"
+            );
+            let mut peak = 0.0f32;
+            for _ in 0..120 {
+                world.step();
+                let speed = world
+                    .body_velocity(hero_id)
+                    .expect("the hero is alive")
+                    .length();
+                peak = peak.max(speed);
+            }
+            peak
+        };
+
+        let (near, mid, far) = (returned(1.0), returned(4.0), returned(16.0));
+        assert!(
+            near < mid && mid < far,
+            "the prototype's ordering was not reproduced: {near}, {mid}, {far}"
+        );
+
+        // Damping is real, so the undamped figure is a ceiling and not the
+        // prediction. The prediction is a quarter cycle of a damped oscillator
+        // released from rest at amplitude `stretch`:
+        //
+        //     zeta  = damping / (2*sqrt(k*m))          = 0.237
+        //     decay = exp(-zeta * (pi/2) / sqrt(1 - zeta^2))
+        //
+        // which gives 12.93 at 4 units and 64.65 at 16. Measured: 13.85 and
+        // 69.19, both 1.07x the prediction, because the true peak arrives a
+        // little before the boundary crossing this closed form is written at.
+        // The bound is therefore 10 percent, and the agreement between the two
+        // distances is the real content: a linear spring must return a speed
+        // proportional to its Stretch, and this one does to within a tenth of
+        // a percent of 5.00x across a five-fold Stretch.
+        let zeta = DEFAULT_DAMPING / (2.0 * (k * DEFAULT_PLAYER_MASS).sqrt());
+        let decay = (-zeta * core::f32::consts::FRAC_PI_2 / (1.0 - zeta * zeta).sqrt()).exp();
+        for (distance, measured) in [(4.0f32, mid), (16.0, far)] {
+            let stretch = distance - REST_LENGTH;
+            let stored = stretch * (k / DEFAULT_PLAYER_MASS).sqrt();
+            assert!(
+                measured <= stored * 1.001,
+                "a damped spring returned more than it stored at {distance}: \
+                 {measured} against a stored {stored}"
+            );
+            let predicted = stored * decay;
+            assert!(
+                (measured - predicted).abs() < predicted * 0.10,
+                "at {distance} units expected about {predicted}, measured {measured}"
+            );
+        }
+
+        // The gain the prototype calls the real pass or fail: the long Stretch
+        // is worth multiples of the short one and not a few percent. Five times
+        // the Stretch returns five times the speed, measured at 5.00x here
+        // against the prototype's 4.70x from the same two rows.
+        let gain = far / mid;
+        assert!(
+            (4.5..=5.5).contains(&gain),
+            "expected roughly 5x from 4 units to 16, got {gain}x"
+        );
+        // And the headline against the short Attach, which is what the
+        // prototype's 12.71x is about: a deliberately loaded Stretch returns an
+        // order of magnitude more speed than Attaching at arm's length.
+        assert!(
+            far > near * 10.0,
+            "a loaded Stretch must be worth many times a short Attach: \
+             {far} against {near}"
+        );
+    }
+
+    #[test]
     fn re_targeting_a_slot_to_a_different_terrain_anchor_snaps_rather_than_sweeping() {
         // ADR-0009: "a re-fired one snaps, otherwise it sweeps across the
         // level". Until this ticket that case was unreachable, because a slot
