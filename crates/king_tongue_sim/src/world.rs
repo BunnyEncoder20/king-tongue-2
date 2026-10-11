@@ -7,9 +7,17 @@
 //! snapshots this type retains.
 
 use crate::frame::{Body, BodyKind, Snapshot};
-use crate::level::Level;
-use crate::{EntityId, DEFAULT_PLAYER_MASS, DT, GRAVITY};
+use crate::level::{Aabb, Level};
+use crate::{EntityId, DEFAULT_PLAYER_MASS, DT, GRAVITY, PLAYER_RADIUS};
 use glam::Vec2;
+
+/// How many times one Sim Tick's motion may be redirected by a surface.
+///
+/// Each pass consumes the part of the motion heading into a surface and carries
+/// the rest along it, so a body entering a corner needs two: one per face. Four
+/// is slack for an axis-aligned world and bounds the work per tick, which a
+/// `while` loop would not.
+const MAX_SLIDE_PASSES: usize = 4;
 
 /// One simulated body. Private on purpose: the Shell and the tests see bodies
 /// only through a [`Snapshot`], so the internal representation stays free to
@@ -128,15 +136,26 @@ impl World {
             let a0 = body_force(&body) / body.mass;
             let target = body.pos + body.vel * DT + 0.5 * a0 * DT * DT;
 
+            // Terrain is a constraint on motion and not a force, which is what
+            // keeps `body_force` pure: contact is resolved out here, once, and
+            // never inside an acceleration that gets evaluated twice.
+            let (pos, contacts) = sweep(body.pos, target, PLAYER_RADIUS, &self.static_terrain);
+
             // The second of the two evaluations ADR-0007 pays for. It probes a
             // hypothetical state rather than the live body, which is why
             // `body_force` takes a state by value and can touch nothing else.
             let mut probe = body;
-            probe.pos = target;
+            probe.pos = pos;
             let a1 = body_force(&probe) / body.mass;
 
-            self.bodies[i].pos = target;
-            self.bodies[i].vel = body.vel + 0.5 * (a0 + a1) * DT;
+            // Cancelling after the velocity half-step and not before is
+            // load-bearing: the half-step adds another tick of gravity, and
+            // leaving that in would let a resting body build downward speed
+            // against the floor and eventually creep through it.
+            let vel = contacts.cancel_into_surfaces(body.vel + 0.5 * (a0 + a1) * DT);
+
+            self.bodies[i].pos = pos;
+            self.bodies[i].vel = vel;
         }
 
         self.tick += 1;
@@ -170,6 +189,228 @@ fn body_force(body: &BodyState) -> Vec2 {
     // Gravity, scaled by mass so the caller can divide by mass uniformly and
     // every force in this function means the same thing.
     body.mass * GRAVITY
+}
+
+/// The surfaces a body ended a Sim Tick touching.
+///
+/// Fixed capacity rather than a `Vec`, because this is built once per body per
+/// tick and allocating 60 times a second per body for at most four normals is
+/// waste the frame contract already refuses elsewhere.
+#[derive(Clone, Copy, Debug, Default)]
+struct Contacts {
+    normals: [Vec2; MAX_SLIDE_PASSES],
+    count: usize,
+}
+
+impl Contacts {
+    fn push(&mut self, normal: Vec2) {
+        if self.count < MAX_SLIDE_PASSES {
+            self.normals[self.count] = normal;
+            self.count += 1;
+        }
+    }
+
+    /// Removes any part of `vel` heading into a surface in contact, leaving the
+    /// part running along it.
+    ///
+    /// Motion *away* from a surface is untouched, which is what lets a body
+    /// leave a contact it is no longer being pressed into. There is no
+    /// restitution here: the hero does not bounce off terrain, and the Combo
+    /// rule that survives a bounce is a later ticket's business.
+    fn cancel_into_surfaces(&self, mut vel: Vec2) -> Vec2 {
+        for normal in &self.normals[..self.count] {
+            let into = vel.dot(*normal);
+            if into < 0.0 {
+                vel -= *normal * into;
+            }
+        }
+        vel
+    }
+}
+
+/// Moves a circle of `radius` from `start` toward `target`, stopping at the
+/// first surface it would cross and carrying the rest of the motion along that
+/// surface. Reports where it ended up and what it is touching.
+///
+/// Swept rather than resolved after the fact, and that is the whole point. At
+/// the speeds a Tongue slingshot reaches, a body can cross a thin platform
+/// entirely within one Sim Tick: it is above the platform at the start of the
+/// tick and below it at the end, never inside it. An overlap test sees nothing
+/// to fix and the body sails through. Sweeping asks whether the *path* crossed
+/// the surface, which is a question that has an answer at any speed.
+fn sweep(start: Vec2, target: Vec2, radius: f32, terrain: &[Aabb]) -> (Vec2, Contacts) {
+    let mut pos = start;
+    let mut remaining = target - start;
+    let mut contacts = Contacts::default();
+
+    for _ in 0..MAX_SLIDE_PASSES {
+        // Clear any existing overlap first. This covers a body authored inside
+        // terrain, and the float residue at a resting contact where the body
+        // sits one ulp inside the surface it is standing on.
+        if let Some((corrected, normal)) = depenetrate(pos, radius, terrain) {
+            pos = corrected;
+            contacts.push(normal);
+            remaining -= normal * remaining.dot(normal).min(0.0);
+        }
+
+        match first_crossing(pos, remaining, radius, terrain) {
+            None => {
+                pos += remaining;
+                break;
+            }
+            Some((t, normal)) => {
+                pos += remaining * t;
+                let leftover = remaining * (1.0 - t);
+                // Slide: drop the part heading into the surface, keep the rest.
+                remaining = leftover - normal * leftover.dot(normal);
+                contacts.push(normal);
+                if remaining.length_squared() < 1e-12 {
+                    break;
+                }
+            }
+        }
+    }
+
+    (pos, contacts)
+}
+
+/// Pushes a circle out of the terrain box it is most deeply inside, if any, and
+/// reports the surface normal it left through.
+///
+/// Returns a zero-depth correction when the circle is exactly tangent, which is
+/// not a no-op: the normal it reports is how a resting body's contact gets
+/// registered at all.
+fn depenetrate(pos: Vec2, radius: f32, terrain: &[Aabb]) -> Option<(Vec2, Vec2)> {
+    let mut deepest: Option<(f32, Vec2)> = None;
+
+    for aabb in terrain {
+        let closest = pos.clamp(aabb.min(), aabb.max());
+        let away = pos - closest;
+        let dist_sq = away.length_squared();
+        if dist_sq > radius * radius {
+            continue;
+        }
+
+        let (normal, depth) = if dist_sq > 1e-12 {
+            let dist = dist_sq.sqrt();
+            (away / dist, radius - dist)
+        } else {
+            // The centre is inside the box, so there is no outward direction to
+            // read off the geometry. Leave through the nearest face, which is
+            // the shortest way out and the only choice that does not teleport
+            // the body across the level.
+            let to_min = pos - aabb.min();
+            let to_max = aabb.max() - pos;
+            let faces = [
+                (to_min.x, Vec2::NEG_X),
+                (to_max.x, Vec2::X),
+                (to_min.y, Vec2::NEG_Y),
+                (to_max.y, Vec2::Y),
+            ];
+            let (dist, normal) =
+                faces
+                    .iter()
+                    .copied()
+                    .fold((f32::INFINITY, Vec2::Y), |best, face| {
+                        if face.0 < best.0 {
+                            face
+                        } else {
+                            best
+                        }
+                    });
+            (normal, dist + radius)
+        };
+
+        if deepest.is_none_or(|(d, _)| depth > d) {
+            deepest = Some((depth, normal));
+        }
+    }
+
+    deepest.map(|(depth, normal)| (pos + normal * depth, normal))
+}
+
+/// The first surface the swept circle crosses over this motion, as a fraction
+/// of the motion and the normal of the face it meets.
+fn first_crossing(
+    origin: Vec2,
+    motion: Vec2,
+    radius: f32,
+    terrain: &[Aabb],
+) -> Option<(f32, Vec2)> {
+    if motion.length_squared() < 1e-12 {
+        return None;
+    }
+    let mut first: Option<(f32, Vec2)> = None;
+    for aabb in terrain {
+        if let Some(hit) = crossing(origin, motion, *aabb, radius) {
+            if first.is_none_or(|(t, _)| hit.0 < t) {
+                first = Some(hit);
+            }
+        }
+    }
+    first
+}
+
+/// Slab test of a ray against one box grown by `radius`.
+///
+/// Growing the box is the Minkowski trick: a circle sweeping against a box is
+/// a point sweeping against that box expanded by the circle's radius. It treats
+/// corners as square rather than rounded, which makes a corner hit register
+/// marginally early. In an axis-aligned Placeholder Geometry world that is
+/// invisible, and the alternative is per-corner circle tests for an accuracy
+/// nothing here can see.
+fn crossing(origin: Vec2, motion: Vec2, aabb: Aabb, radius: f32) -> Option<(f32, Vec2)> {
+    let grown = Vec2::splat(radius);
+    let min = aabb.min() - grown;
+    let max = aabb.max() + grown;
+
+    let mut t_enter = f32::NEG_INFINITY;
+    let mut t_exit = f32::INFINITY;
+    let mut normal = Vec2::ZERO;
+
+    for axis in 0..2 {
+        let d = motion[axis];
+        let o = origin[axis];
+        if d.abs() < 1e-12 {
+            // Running parallel to this pair of faces: either the ray is between
+            // them for the whole motion or it never meets the box at all.
+            if o < min[axis] || o > max[axis] {
+                return None;
+            }
+            continue;
+        }
+
+        let mut near = (min[axis] - o) / d;
+        let mut far = (max[axis] - o) / d;
+        // Entering from the low side means the face's outward normal points the
+        // negative way along this axis, and the reverse coming from the high
+        // side. Decided from the direction of travel, before the two times are
+        // put in order.
+        let mut face = Vec2::ZERO;
+        face[axis] = if d > 0.0 { -1.0 } else { 1.0 };
+        if near > far {
+            core::mem::swap(&mut near, &mut far);
+        }
+
+        if near > t_enter {
+            t_enter = near;
+            normal = face;
+        }
+        if far < t_exit {
+            t_exit = far;
+        }
+    }
+
+    if t_enter > t_exit || t_exit < 0.0 || t_enter > 1.0 {
+        return None;
+    }
+    if t_enter < 0.0 {
+        // Already overlapping when the motion began. That is depenetration's
+        // job, and treating it as a crossing here would place the body at a
+        // negative fraction of its own motion.
+        return None;
+    }
+    Some((t_enter, normal))
 }
 
 /// Fills `out` with everything the Shell needs to draw one Sim Tick.
@@ -255,7 +496,8 @@ mod tests {
             "after {TICKS} ticks expected y {expected}, measured {measured}"
         );
         assert_eq!(
-            hero(&world).pos.x, start.x,
+            hero(&world).pos.x,
+            start.x,
             "nothing pushes sideways, so there must be no horizontal drift"
         );
     }
@@ -293,6 +535,122 @@ mod tests {
             world.snapshot().bodies.capacity(),
             capacity,
             "snapshot buffers must not grow per tick"
+        );
+    }
+
+    #[test]
+    fn hero_lands_on_the_floor_and_stays_there() {
+        let level = Level::from_ascii(
+            "
+            ....@....
+            .........
+            .........
+            #########
+            ",
+        );
+        // The floor's top surface, from the level data rather than from a magic
+        // number, plus the hero's radius: a circle rests tangent to a surface.
+        let floor_top = level
+            .static_terrain
+            .iter()
+            .map(|t| t.max().y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let rest_y = floor_top + PLAYER_RADIUS;
+
+        let mut world = World::from_level(&level);
+        for _ in 0..200 {
+            world.step();
+        }
+
+        // Tolerance: one tick of gravity's position term, 0.5 * g * DT^2, which
+        // is the most a resting body can dip before the contact pushes it back.
+        let slack = 0.5 * GRAVITY.length() * DT * DT * 2.0;
+        let landed = hero(&world).pos;
+        assert!(
+            (landed.y - rest_y).abs() < slack.max(1e-4),
+            "expected to rest at y {rest_y}, got {landed:?}"
+        );
+
+        // And it stays. A body that keeps accumulating downward velocity against
+        // a contact creeps through the floor over a long run.
+        for _ in 0..600 {
+            world.step();
+        }
+        let settled = hero(&world).pos;
+        assert!(
+            (settled.y - rest_y).abs() < slack.max(1e-4),
+            "drifted after 600 more ticks: {landed:?} then {settled:?}"
+        );
+    }
+
+    #[test]
+    fn a_fast_hero_does_not_tunnel_through_a_thin_floor() {
+        // Hostile on purpose. The hero is dropped from 10,000 units onto a
+        // floor 0.2 units thick, arriving at roughly 180 units per second: it
+        // covers about 3 units per Sim Tick, while the band in which it would
+        // ever be found overlapping the floor is only 1.2 units deep. So for
+        // most of the tick it is above the floor and at the end of the tick it
+        // is below, never inside, and resolving overlap after the fact sees
+        // nothing to fix.
+        //
+        // The drop is repeated across a range of start heights wider than one
+        // tick's travel, which is the point. A single drop can land inside the
+        // band by luck and pass while tunnelling in general; sweeping the start
+        // height sweeps the phase, so at least one case has to be caught by
+        // asking whether the path crossed the surface rather than whether the
+        // body ended up inside it.
+        for step in 0..13 {
+            let spawn_y = 10_000.0 + step as f32 * 0.25;
+            let level = Level {
+                world_bounds: Aabb::new(Vec2::new(0.0, 5_100.0), Vec2::new(1_000.0, 5_200.0)),
+                static_terrain: vec![Aabb::new(Vec2::new(0.0, -0.1), Vec2::new(1_000.0, 0.1))],
+                player_spawn: Vec2::new(0.0, spawn_y),
+                enemy_spawns: vec![],
+            };
+            level.validate().expect("fixture must be a valid level");
+
+            let mut world = World::from_level(&level);
+            // Impact lands near tick 6667; run past it so it must also rest.
+            for _ in 0..7_000 {
+                world.step();
+            }
+
+            let landed = hero(&world).pos;
+            assert!(
+                landed.y > 0.0,
+                "dropped from {spawn_y}, the hero tunnelled through to {landed:?}"
+            );
+            assert!(
+                (landed.y - PLAYER_RADIUS).abs() < 1e-3,
+                "dropped from {spawn_y}, expected to rest at y {PLAYER_RADIUS}, got {landed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hero_spawned_inside_terrain_is_pushed_out_rather_than_trapped() {
+        // A spawn point inside a terrain block is an authoring mistake a level
+        // file can carry, and `validate` cannot catch it without knowing the
+        // hero's radius. Being pushed to the surface is recoverable; being held
+        // inside the floor is a level that cannot start.
+        let block = Aabb::new(Vec2::ZERO, Vec2::new(10.0, 2.0));
+        let level = Level {
+            world_bounds: Aabb::new(Vec2::ZERO, Vec2::splat(50.0)),
+            static_terrain: vec![block],
+            // Well inside the block, nearest exit straight up.
+            player_spawn: Vec2::new(0.0, 1.0),
+            enemy_spawns: vec![],
+        };
+        level.validate().expect("fixture must be a valid level");
+
+        let mut world = World::from_level(&level);
+        for _ in 0..120 {
+            world.step();
+        }
+        let pos = hero(&world).pos;
+        assert!(
+            (pos.y - (block.max().y + PLAYER_RADIUS)).abs() < 1e-3,
+            "expected to be pushed out to rest on the block, got {pos:?}"
         );
     }
 
