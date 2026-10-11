@@ -267,6 +267,82 @@ mod tests {
     }
 
     #[test]
+    fn two_pulls_sum_to_the_prototypes_exact_force_figures() {
+        // The ticket #14 numbers, and they are exact rather than approximate.
+        // Each was measured in the #8 prototype at **zero velocity**, which is
+        // what makes them safe to pin: the damping term is `damping *
+        // radial_vel`, so at rest it is identically zero and nothing is left but
+        // vector algebra over Hooke's law. At `k = 40` with the Anchor 10 units
+        // away the Stretch is `10 - REST_LENGTH = 9`, so one Tongue pulls
+        // `40 * 9 = 360` and the rest follows from geometry:
+        //
+        //     one Tongue                  |F| = 360.000   1.000x
+        //     two on the same Anchor      |F| = 720.000   2.000x
+        //     two exactly opposed         |F| =   0.000   cancels
+        //     two perpendicular           |F| = 509.117   1.414x
+        //
+        // The contrast worth knowing is with the same prototype's slingshot
+        // return speeds, which ticket #13 found are *not* reproducible at the
+        // shipped `DEFAULT_DAMPING` (ADR-0003). Force summation at rest does not
+        // depend on the damping constant at all, which is exactly why these
+        // survive and those did not.
+        const K: f32 = 40.0;
+        const UP: Vec2 = Vec2::new(0.0, 10.0);
+        const DOWN: Vec2 = Vec2::new(0.0, -10.0);
+        const RIGHT: Vec2 = Vec2::new(10.0, 0.0);
+        // Three decimals, which is the precision the prototype's figures are
+        // quoted to.
+        const TOLERANCE: f32 = 1e-3;
+
+        let total = |anchors: &[Vec2]| {
+            let mut pulls = Pulls::default();
+            for anchor in anchors {
+                pulls.push(*anchor, K);
+            }
+            pulls.force(Vec2::ZERO, Vec2::ZERO)
+        };
+
+        let one = total(&[UP]);
+        assert!(
+            (one.length() - 360.0).abs() < TOLERANCE,
+            "one Tongue 10 units out at k {K} must pull 360.000, got {}",
+            one.length()
+        );
+
+        let aligned = total(&[UP, UP]);
+        assert!(
+            (aligned.length() - 720.0).abs() < TOLERANCE,
+            "two Tongues on one Anchor must pull 720.000, got {}",
+            aligned.length()
+        );
+        assert!(
+            (aligned - one * 2.0).length() < TOLERANCE,
+            "aligned pulls must double in direction too: {aligned:?} against {one:?}"
+        );
+
+        let opposed = total(&[UP, DOWN]);
+        assert!(
+            opposed.length() < TOLERANCE,
+            "two exactly opposed Tongues must cancel to 0.000, got {opposed:?}"
+        );
+
+        let perpendicular = total(&[UP, RIGHT]);
+        let expected = 360.0 * core::f32::consts::SQRT_2;
+        assert!(
+            (perpendicular.length() - expected).abs() < TOLERANCE,
+            "two perpendicular Tongues must pull {expected:.3} (509.117), got {}",
+            perpendicular.length()
+        );
+        // And along the diagonal between them, which the magnitude alone does
+        // not pin down: a sum that dropped one component would still be 1.414x
+        // if it scaled the other.
+        assert!(
+            (perpendicular.normalize() - Vec2::new(1.0, 1.0).normalize()).length() < TOLERANCE,
+            "the resultant must bisect the two Anchors, got {perpendicular:?}"
+        );
+    }
+
+    #[test]
     fn pull_uses_the_prototypes_measured_defaults() {
         // The wrapper must not invent its own damping or ceiling. Checked
         // against the free function with the constants passed explicitly, so a

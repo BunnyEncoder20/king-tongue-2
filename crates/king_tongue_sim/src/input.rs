@@ -237,6 +237,35 @@ mod tests {
     }
 
     #[test]
+    fn each_slot_fires_and_releases_on_its_own() {
+        // Two Tongues held independently, which ADR-0006 reaches through one
+        // finger staying **down**: it keeps slot 0, so every later Gesture
+        // lands on slot 1 and acts on whatever is there. A rule that scanned
+        // for a vacant slot instead would send the Release at the third step
+        // back to slot 0 and take the wrong Tongue away.
+        let mut tracker = GestureTracker::new();
+        assert_eq!(tracker.claim(1, [true, true]), Some(Claim::Fire(0)));
+        assert_eq!(
+            tracker.claim(2, [false, true]),
+            Some(Claim::Fire(1)),
+            "a second overlapping finger fires the second Tongue"
+        );
+
+        // The second finger lifts, which ends its Gesture and leaves its Tongue
+        // Attached, so the next finger finds slot 1 unowned and occupied.
+        tracker.release_owner(2);
+        assert_eq!(
+            tracker.claim(3, [false, false]),
+            Some(Claim::Release(1)),
+            "with slot 0 still owned, the Release must land on slot 1"
+        );
+
+        // And slot 1 is immediately usable again while slot 0 stays Attached.
+        tracker.release_owner(3);
+        assert_eq!(tracker.claim(4, [false, true]), Some(Claim::Fire(1)));
+    }
+
+    #[test]
     fn gestures_are_taken_in_ascending_id_order() {
         // The regression this prevents is silent. Two fingers landing in one
         // frame arrive in `HashMap` order, so reading the slice as given would

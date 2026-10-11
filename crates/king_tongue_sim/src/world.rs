@@ -767,7 +767,7 @@ fn write_snapshot(
 mod tests {
     use super::*;
 
-    use crate::{DEFAULT_DAMPING, REST_LENGTH};
+    use crate::{DEFAULT_DAMPING, DEFAULT_FORCE_CEILING, REST_LENGTH};
 
     /// The hero as the seam exposes it: looked up by identity, never by slice
     /// position, because spawn order is not part of the contract.
@@ -855,6 +855,84 @@ mod tests {
             "a tap toward {direction:?} must Attach exactly one Tongue"
         );
         tongues[0].to
+    }
+
+    /// Sends one frame's worth of touches, each aimed relative to the hero.
+    ///
+    /// One call rather than one per finger, because that is how a platform
+    /// reports a frame: every live touch arrives together. It also matters for
+    /// what is being tested, since ADR-0006 makes two concurrent Tongues require
+    /// two **overlapping** fingers, and fingers that landed in separate calls
+    /// would Release each other's slot instead.
+    fn touch_frame(world: &mut World, touches: &[(u64, TouchPhase, Vec2)]) {
+        let from = hero(world).pos;
+        let samples: Vec<TouchSample> = touches
+            .iter()
+            .map(|(id, phase, aim)| TouchSample {
+                id: *id,
+                phase: *phase,
+                pos: from + *aim,
+            })
+            .collect();
+        world.apply_touches(&samples);
+    }
+
+    /// Where the Tongue in `slot` is Attached, or `None` if that slot is empty.
+    ///
+    /// Looked up by slot rather than by position in the list, because the order
+    /// the `Snapshot` lists Tongues in is not part of the contract.
+    fn slot_anchor(world: &World, slot: u8) -> Option<Vec2> {
+        world
+            .snapshot()
+            .tongues
+            .iter()
+            .find(|line| line.slot == slot)
+            .map(|line| line.to)
+    }
+
+    /// The hero at the origin with a surface exactly 10 units away in each of
+    /// the four axis directions, and nothing else in reach.
+    ///
+    /// Built for the ticket #14 force figures, which were measured with the
+    /// Anchor 10 units out: the Stretch is then `10 - REST_LENGTH = 9` and one
+    /// Tongue pulls `DEFAULT_PULL_STRENGTH * 9 = 360`. The hero sits at the
+    /// origin so that one tick's displacement is exact rather than a difference
+    /// of two large coordinates.
+    fn cross() -> Level {
+        let face = |centre: Vec2| Aabb::new(centre, Vec2::splat(0.5));
+        let level = Level {
+            world_bounds: Aabb::new(Vec2::ZERO, Vec2::splat(500.0)),
+            static_terrain: vec![
+                face(Vec2::new(0.0, 10.5)),
+                face(Vec2::new(0.0, -10.5)),
+                face(Vec2::new(10.5, 0.0)),
+                face(Vec2::new(-10.5, 0.0)),
+            ],
+            player_spawn: Vec2::ZERO,
+            enemy_spawns: vec![],
+        };
+        level.validate().expect("fixture must be a valid level");
+        level
+    }
+
+    /// Two walls 2000 units apart with the hero midway between them.
+    ///
+    /// The configuration ADR-0003 calls finite and an earlier version of
+    /// ADR-0006 called infeasible. Attaching to both at once is a genuine test
+    /// of the claim that forces sum rather than fight.
+    fn wide_canyon() -> Level {
+        let level = Level {
+            world_bounds: Aabb::new(Vec2::ZERO, Vec2::splat(3_000.0)),
+            static_terrain: vec![
+                // Inner faces at x = 1000 and x = -1000.
+                Aabb::new(Vec2::new(1_500.0, 0.0), Vec2::new(500.0, 1_000.0)),
+                Aabb::new(Vec2::new(-1_500.0, 0.0), Vec2::new(500.0, 1_000.0)),
+            ],
+            player_spawn: Vec2::ZERO,
+            enemy_spawns: vec![],
+        };
+        level.validate().expect("fixture must be a valid level");
+        level
     }
 
     #[test]
@@ -2046,6 +2124,388 @@ mod tests {
             two > one * 1.5,
             "two Tongues on one Anchor pulled {two} against one Tongue's {one}"
         );
+    }
+
+    #[test]
+    fn the_two_tongues_sum_as_vectors_at_the_prototypes_exact_ratios() {
+        // Ticket #14's headline, through the seam and in force units:
+        //
+        //     one Tongue                  |F| = 360.000   1.000x
+        //     two on the same Anchor      |F| = 720.000   2.000x
+        //     two exactly opposed         |F| =   0.000   cancels
+        //     two perpendicular           |F| = 509.117   1.414x
+        //
+        // Exact rather than approximate, because every row was measured at zero
+        // velocity: ADR-0003's damping term is `damping * radial_vel`, so at
+        // rest it is identically zero and nothing is left but Hooke's law summed
+        // as vectors. The `cross` fixture puts every Anchor exactly 10 units
+        // out, so the Stretch is `10 - REST_LENGTH = 9` and `DEFAULT_PULL_STRENGTH
+        // * 9 = 360` is arithmetic rather than a recorded measurement.
+        //
+        // The same prototype's slingshot *return speeds* are deliberately not
+        // asserted anywhere: ticket #13 found they are unreproducible at the
+        // shipped `DEFAULT_DAMPING`, and ADR-0003 records why. Forces at rest do
+        // not depend on that constant at all, which is the difference.
+        // Three decimals, which is the precision the prototype quotes. The
+        // recovery is tighter than that: measured 360.0 exactly, 719.99994,
+        // 1.2e-7 for the cancelling pair, and 509.11688, so the bound is the
+        // figures' precision rather than the method's.
+        const TOLERANCE: f32 = 1e-3;
+        assert_eq!(
+            DEFAULT_PULL_STRENGTH * (10.0 - REST_LENGTH),
+            360.0,
+            "the prototype's figures assume k 40, a 10 unit Anchor and a 9 unit Stretch"
+        );
+
+        // The force the Tongues applied on the first tick after Attaching,
+        // recovered from how far the hero moved. Velocity Verlet's position
+        // update is `pos + vel*DT + 0.5*a0*DT^2` and the hero starts at rest, so
+        // one tick's displacement is exactly `0.5*a0*DT^2`, and `a0` is the
+        // acceleration at the moment of the Attach. Gravity is the only other
+        // force in this fixture, so subtracting it leaves the resultant pull.
+        // Inverting the integrator rather than reading a private field is what
+        // keeps this a `Snapshot` assertion.
+        let resultant = |aims: &[Vec2]| -> Vec2 {
+            let mut world = World::from_level(&cross());
+            let from = hero(&world).pos;
+            let touches: Vec<(u64, TouchPhase, Vec2)> = aims
+                .iter()
+                .enumerate()
+                .map(|(i, aim)| (i as u64 + 1, TouchPhase::Started, *aim))
+                .collect();
+            // One frame, every finger down together: ADR-0006 makes two Tongues
+            // require two overlapping fingers, so a tap and a lift and another
+            // tap would Release rather than hold a second.
+            touch_frame(&mut world, &touches);
+            world.step();
+            assert_eq!(
+                world.snapshot().tongues.len(),
+                aims.len(),
+                "the fixture must Attach one Tongue per aim, or the ratio below means nothing"
+            );
+            let moved = hero(&world).pos - from;
+            DEFAULT_PLAYER_MASS * (2.0 * moved / (DT * DT) - GRAVITY)
+        };
+
+        let one = resultant(&[Vec2::Y]);
+        assert!(
+            (one.length() - 360.0).abs() < TOLERANCE,
+            "one Tongue must pull 360.000, measured {}",
+            one.length()
+        );
+
+        let aligned = resultant(&[Vec2::Y, Vec2::Y]);
+        assert!(
+            (aligned.length() - 720.0).abs() < TOLERANCE,
+            "two Tongues on the same Anchor must pull 720.000 (2.000x), measured {}",
+            aligned.length()
+        );
+
+        let opposed = resultant(&[Vec2::Y, Vec2::NEG_Y]);
+        assert!(
+            opposed.length() < TOLERANCE,
+            "two exactly opposed Tongues must cancel to 0.000, measured {opposed:?}"
+        );
+
+        let perpendicular = resultant(&[Vec2::Y, Vec2::X]);
+        let expected = 360.0 * core::f32::consts::SQRT_2;
+        assert!(
+            (perpendicular.length() - expected).abs() < TOLERANCE,
+            "two perpendicular Tongues must pull {expected:.3} (509.117, 1.414x), measured {}",
+            perpendicular.length()
+        );
+        // The direction too, which the magnitude alone does not pin down: a sum
+        // that dropped one Tongue and scaled the other would still read 1.414x.
+        assert!(
+            (perpendicular.normalize() - Vec2::new(1.0, 1.0).normalize()).length() < 1e-3,
+            "the resultant must bisect the two Anchors, measured {perpendicular:?}"
+        );
+    }
+
+    #[test]
+    fn both_tongues_may_share_one_anchor_and_both_are_drawn() {
+        // Spec story 14, and the drawing half of the AC. Two Tongues on one
+        // Anchor are two separate [`TongueLine`]s in the `Snapshot`, not one
+        // line counted twice: the Shell draws whatever it is given, so a slot
+        // collapsed here is a Tongue the player never sees.
+        let mut world = World::from_level(&room());
+        touch_frame(
+            &mut world,
+            &[
+                (1, TouchPhase::Started, Vec2::Y),
+                (2, TouchPhase::Started, Vec2::Y),
+            ],
+        );
+        world.step();
+
+        let lines = world.snapshot().tongues.clone();
+        assert_eq!(lines.len(), MAX_TONGUES, "both slots must hold a Tongue");
+        let mut slots: Vec<u8> = lines.iter().map(|l| l.slot).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, vec![0, 1], "each Tongue must occupy its own slot");
+        assert_eq!(
+            lines[0].to, lines[1].to,
+            "both Tongues were aimed at the same surface"
+        );
+        assert_eq!(
+            lines[0].anchor, lines[1].anchor,
+            "sharing an Anchor means sharing the Anchor, not two coincident ones"
+        );
+        let from = hero(&world).pos;
+        assert!(
+            lines.iter().all(|l| l.from == from),
+            "both Tongues are drawn from the hero: {lines:?}"
+        );
+
+        // And both survive the frame contract, which is what "drawn" means for
+        // the Shell: it renders an interpolated view and never the raw snapshot.
+        let mut view = Snapshot::default();
+        crate::frame::interpolate_into(world.previous_snapshot(), world.snapshot(), 0.5, &mut view);
+        assert_eq!(
+            view.tongues.len(),
+            MAX_TONGUES,
+            "a Tongue was lost in interpolation: {:?}",
+            view.tongues
+        );
+    }
+
+    #[test]
+    fn each_slot_fires_and_releases_without_disturbing_the_other() {
+        // The AC's first line, and the whole of ADR-0006's slot rule exercised
+        // in one run. A Gesture claims the lowest slot no other finger is
+        // driving, and taking an empty slot fires while taking an occupied one
+        // Releases, so "independently" is reached by keeping the first finger
+        // **down**: it holds slot 0, which sends every later tap to slot 1.
+        //
+        // The failure this prevents is a Release that reaches for the wrong
+        // slot. Both slots hold a Tongue and both tests above would still pass
+        // if a Release cleared slot 0 whenever it was asked for slot 1.
+        let mut world = World::from_level(&room());
+
+        touch_frame(&mut world, &[(1, TouchPhase::Started, Vec2::Y)]);
+        world.step();
+        let ceiling = world.snapshot().tongues[0].to;
+
+        // Finger 1 is still down, so finger 2 lands in slot 1 and fires.
+        touch_frame(
+            &mut world,
+            &[
+                (1, TouchPhase::Stationary, Vec2::Y),
+                (2, TouchPhase::Started, Vec2::X),
+            ],
+        );
+        world.step();
+        let right_wall = slot_anchor(&world, 1).expect("slot 1 must have fired");
+        assert_eq!(world.snapshot().tongues.len(), MAX_TONGUES);
+        assert_ne!(
+            ceiling, right_wall,
+            "the fixture must Attach the two slots to different surfaces"
+        );
+
+        // Finger 2 lifts, which ends its Gesture and leaves its Tongue
+        // Attached, then finger 3 lands while finger 1 still holds slot 0. It
+        // therefore takes slot 1, finds a Tongue there, and Releases it. Its aim
+        // is downward, at a surface neither slot is Attached to, so a Release
+        // that re-fired instead would be unmistakable.
+        touch_frame(
+            &mut world,
+            &[
+                (1, TouchPhase::Stationary, Vec2::Y),
+                (2, TouchPhase::Ended, Vec2::X),
+            ],
+        );
+        touch_frame(
+            &mut world,
+            &[
+                (1, TouchPhase::Stationary, Vec2::Y),
+                (3, TouchPhase::Started, Vec2::NEG_Y),
+            ],
+        );
+        world.step();
+        assert_eq!(
+            slot_anchor(&world, 0),
+            Some(ceiling),
+            "Releasing slot 1 disturbed slot 0: {:?}",
+            world.snapshot().tongues
+        );
+        assert_eq!(
+            slot_anchor(&world, 1),
+            None,
+            "slot 1 must be Released: {:?}",
+            world.snapshot().tongues
+        );
+
+        // And slot 1 is immediately usable again while slot 0 keeps Swinging,
+        // which is the brace-between-two-Anchors loop from spec story 12.
+        touch_frame(
+            &mut world,
+            &[
+                (1, TouchPhase::Stationary, Vec2::Y),
+                (3, TouchPhase::Ended, Vec2::NEG_Y),
+            ],
+        );
+        touch_frame(
+            &mut world,
+            &[
+                (1, TouchPhase::Stationary, Vec2::Y),
+                (4, TouchPhase::Started, Vec2::NEG_X),
+            ],
+        );
+        world.step();
+        let left_wall = slot_anchor(&world, 1).expect("slot 1 must have re-fired");
+        assert_eq!(
+            slot_anchor(&world, 0),
+            Some(ceiling),
+            "re-firing slot 1 disturbed slot 0"
+        );
+        assert_ne!(left_wall, right_wall, "slot 1 re-aimed at the other wall");
+
+        // Now the other way round: finger 1 lifts, a new finger takes the slot
+        // it gave up, and Releasing slot 0 leaves slot 1 Attached.
+        touch_frame(
+            &mut world,
+            &[
+                (1, TouchPhase::Ended, Vec2::Y),
+                (4, TouchPhase::Stationary, Vec2::NEG_X),
+            ],
+        );
+        touch_frame(
+            &mut world,
+            &[
+                (5, TouchPhase::Started, Vec2::NEG_Y),
+                (4, TouchPhase::Stationary, Vec2::NEG_X),
+            ],
+        );
+        world.step();
+        assert_eq!(
+            slot_anchor(&world, 0),
+            None,
+            "slot 0 must be Released: {:?}",
+            world.snapshot().tongues
+        );
+        assert_eq!(
+            slot_anchor(&world, 1),
+            Some(left_wall),
+            "Releasing slot 0 disturbed slot 1: {:?}",
+            world.snapshot().tongues
+        );
+    }
+
+    #[test]
+    fn a_third_finger_leaves_both_attached_tongues_exactly_as_they_were() {
+        // Spec story 15: a stray touch must never cost a player a run. The
+        // existing third-finger test covers two fingers landing *together*;
+        // this covers the dangerous version, a third finger arriving while two
+        // Tongues are already Attached and Swinging. Discarded has to mean
+        // discarded: not a Release, not a re-target of either slot.
+        let mut world = World::from_level(&room());
+        touch_frame(
+            &mut world,
+            &[
+                (1, TouchPhase::Started, Vec2::Y),
+                (2, TouchPhase::Started, Vec2::X),
+            ],
+        );
+        world.step();
+        let before = world.snapshot().tongues.clone();
+        assert_eq!(before.len(), MAX_TONGUES, "both slots must be Attached");
+
+        for tick in 0..30 {
+            // The stray finger lands on a fresh id every frame, which is the
+            // hostile version: an id the tracker has never seen cannot be
+            // refused for already owning a slot.
+            touch_frame(
+                &mut world,
+                &[
+                    (1, TouchPhase::Stationary, Vec2::Y),
+                    (2, TouchPhase::Stationary, Vec2::X),
+                    (100 + tick, TouchPhase::Started, Vec2::NEG_Y),
+                ],
+            );
+            world.step();
+            let now = world.snapshot().tongues.clone();
+            assert_eq!(
+                now.len(),
+                MAX_TONGUES,
+                "a third finger changed the Tongue count at tick {tick}: {now:?}"
+            );
+            assert_eq!(
+                now.iter().map(|l| l.anchor).collect::<Vec<_>>(),
+                before.iter().map(|l| l.anchor).collect::<Vec<_>>(),
+                "a third finger re-targeted a slot at tick {tick}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchors_two_thousand_units_apart_produce_a_finite_resultant() {
+        // ADR-0003 withdrew ADR-0006's over-constraint warning, and this is the
+        // assertion that the withdrawal was real. Under a distance constraint,
+        // two Anchors 2000 units apart with a hero between them is infeasible:
+        // no position satisfies both, and a solver either jitters or diverges.
+        // Forces merely sum, so there is nothing to satisfy and nothing to
+        // iterate, and the only possible outcome is a finite resultant.
+        //
+        // The regression this prevents is someone reintroducing a solver, a
+        // length limit, or a positional correction. Any of those would show up
+        // here as a non-finite position or a hero flung out of the level, and
+        // nowhere else in the suite: every other Tongue test Attaches within a
+        // few units.
+        let mut world = World::from_level(&wide_canyon());
+        touch_frame(
+            &mut world,
+            &[
+                (1, TouchPhase::Started, Vec2::X),
+                (2, TouchPhase::Started, Vec2::NEG_X),
+            ],
+        );
+        world.step();
+
+        let lines = world.snapshot().tongues.clone();
+        assert_eq!(lines.len(), MAX_TONGUES, "both walls must be Attached");
+        let span = (lines[0].to - lines[1].to).length();
+        assert!(
+            (span - 2_000.0).abs() < 1e-3,
+            "the fixture must span 2000 units, measured {span}"
+        );
+        // And the pulls really are enormous, or "finite" would be a claim about
+        // a mild scene. A 999 unit Stretch asks for 39,960 units of force and
+        // gets [`DEFAULT_FORCE_CEILING`], which is the gameplay cap ADR-0003
+        // describes. The cap is per Tongue, so two of them can ask for twice it:
+        // that is what forces summing means, and the alternative would be a
+        // Tongue that weakened because another one existed.
+        let single = tongue::pull(
+            Vec2::ZERO,
+            Vec2::ZERO,
+            lines[0].to,
+            world.hero_pull_strength(),
+        );
+        assert!(
+            (single.length() - DEFAULT_FORCE_CEILING).abs() < 1e-3,
+            "the fixture must load each Tongue to the force ceiling, got {}",
+            single.length()
+        );
+
+        for tick in 0..3_000 {
+            world.step();
+            let pos = hero(&world).pos;
+            assert!(
+                pos.is_finite(),
+                "diverged at tick {tick}: {pos:?}, which is what a constraint solver would do"
+            );
+            // Both pulls are at the force ceiling and very nearly opposed, so
+            // the hero can only drift a little around the midpoint. A generous
+            // bound: the claim is that it is bounded at all, not where.
+            assert!(
+                pos.length() < 100.0,
+                "the hero was flung to {pos:?} at tick {tick}"
+            );
+            assert_eq!(
+                world.snapshot().tongues.len(),
+                MAX_TONGUES,
+                "a Tongue was dropped at tick {tick}, so the pulls stopped opposing"
+            );
+        }
     }
 
     #[cfg(feature = "serde")]
