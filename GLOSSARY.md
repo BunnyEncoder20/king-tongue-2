@@ -7,12 +7,20 @@ A 2D side-view Android game built entirely in Rust, reimplementing the core grap
 ### Mechanics
 
 **Tongue**:
-The extensible appendage the player fires to attach to an Anchor. It is a means of attachment, not a weapon.
+An extensible appendage the player fires to attach to an Anchor. It is a means of attachment, not a weapon. The player may have up to two attached independently at once.
 _Avoid_: Grapple, hook, rope, whip
 
 **Anchor**:
-A point in the world the Tongue can attach to.
+A point or body in the world a Tongue can attach to.
 _Avoid_: Grapple point, hook point, attachment node
+
+**Fixed Anchor**:
+An Anchor that cannot move, such as a wall or ceiling. Attaching pulls only the player.
+_Avoid_: Static anchor, immovable anchor, world anchor
+
+**Movable Anchor**:
+An Anchor that is itself a body with mass, such as an Enemy. Attaching exchanges momentum, so both bodies are pulled toward each other.
+_Avoid_: Dynamic anchor, enemy anchor
 
 **Attach**:
 The state of the Tongue being connected to an Anchor, holding the player at a bounded radius from it.
@@ -27,8 +35,16 @@ Detaching the Tongue, converting Swing momentum into unconstrained ballistic mot
 _Avoid_: Let go, detach, drop, fire off
 
 **Slam**:
-The outcome of the player colliding with an Enemy while carrying velocity above a threshold.
+The outcome of the player colliding with an Enemy while carrying momentum above the Kick threshold.
 _Avoid_: Hit, attack, bonk, smash
+
+**Kick**:
+The outcome of the player colliding with an Enemy below the Slam threshold: a small fixed damage and an elastic repel that restores distance between the two bodies.
+_Avoid_: Bump, nudge, push, weak hit
+
+**Combo**:
+An unbroken run of Slams, counted while the player is airborne and persisting across Release and re-attach. It is a count of hits, not a score.
+_Avoid_: Streak, chain, multiplier, rally
 
 **Enemy**:
 A body in the world that can be Slammed.
@@ -37,8 +53,8 @@ _Avoid_: Mob, foe, NPC
 ### Input
 
 **Gesture**:
-One continuous touch, from touch down to lift, that drives a full fire, Swing, and Release cycle. The interface has exactly one.
-_Avoid_: Input, control, tap, swipe
+A discrete tap, which either fires a Tongue along the tapped vector or Releases one already attached. It is not a continuous hold.
+_Avoid_: Input, control, swipe, drag
 
 **Tolerance Cone**:
 The angular region around the Gesture's direction inside which the Tongue selects the best valid Anchor, rather than requiring a precise hit.
