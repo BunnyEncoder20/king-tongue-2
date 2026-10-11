@@ -121,10 +121,12 @@ pub fn camera_origin(
 ) -> macroquad::math::Vec2 {
     let centre = screen * 0.5;
     // Inverting `to_screen` for the hero's position: whatever origin puts the
-    // hero at the centre of the screen. The hero is in every snapshot the Core
-    // Sim produces, so the fallback is unreachable in practice; drawing the
-    // world origin at the centre is the inert choice, and it is a drawing
-    // fallback rather than a game rule.
+    // hero at the centre of the screen. The fallback is reachable: the Kill
+    // Bound removes any body that leaves the level's `world_bounds`, the hero
+    // included, and a removed body is simply absent from the Snapshot. Drawing
+    // the world origin at the centre is the inert choice, and it stays a
+    // drawing fallback rather than a game rule: the Shell learns nothing about
+    // despawning and decides nothing because of it.
     view.body(hero).map_or(centre, |body| {
         macroquad::math::Vec2::new(
             centre.x - body.pos.x * PIXELS_PER_UNIT,

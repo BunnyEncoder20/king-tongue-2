@@ -50,6 +50,44 @@ pub fn slam_run(tick: u64, world: &mut World) {
     }
 }
 
+/// Flings every body out of the level's Kill Bound, each on its own tick.
+///
+/// The hero is launched along the floor and out of the right edge; the Enemies
+/// are launched straight up and out of the top. They start at different
+/// distances from the edge they leave through, so the bodies despawn on
+/// different ticks rather than all at once, which is what makes the trace carry
+/// a changing body count for several ticks running.
+///
+/// Nothing in this run carries enough momentum to destroy anything, so every
+/// removal in it is the Kill Bound and not combat. That matters for what the
+/// trace proves: ADR-0011's two ways of losing a body are easy to confuse, and
+/// a script where both happened could not tell which one had diverged.
+pub fn kill_bound_run(tick: u64, world: &mut World) {
+    if tick != 0 {
+        return;
+    }
+
+    let hero = world.hero_id();
+    // Collected before anything is placed: `place` needs the `World` mutably,
+    // and reading the snapshot first keeps the two borrows apart. Snapshot
+    // order is stable within a run, so the order these are applied in is too.
+    let enemies: Vec<(crate::EntityId, Vec2)> = world
+        .snapshot()
+        .bodies
+        .iter()
+        .filter(|b| b.id != hero)
+        .map(|b| (b.id, b.pos))
+        .collect();
+    for (id, pos) in enemies {
+        world.place(id, pos, Vec2::new(0.0, 90.0));
+    }
+
+    let hero_pos = world.snapshot().body(hero).map(|b| b.pos);
+    if let Some(pos) = hero_pos {
+        world.place(hero, pos, Vec2::new(90.0, 0.0));
+    }
+}
+
 /// Runs `ticks` Sim Ticks and returns every `Snapshot` along the way, starting
 /// with the one from before any tick ran.
 pub fn record(level: &Level, ticks: u32, script: Script) -> Vec<Snapshot> {
@@ -231,6 +269,59 @@ mod tests {
         assert!(
             after < before,
             "the scripted run destroyed nothing: {before} bodies throughout"
+        );
+    }
+
+    /// A hero on a floor with a row of Enemies well above its path, so that
+    /// `kill_bound_run` can fling everything out of the bound without anything
+    /// touching anything else. The Kill Bound is the sketch's own extent.
+    fn kill_bound_scene() -> Level {
+        Level::from_ascii(
+            "
+            .eee.....
+            .........
+            @........
+            #########
+            ",
+        )
+    }
+
+    #[test]
+    fn a_run_that_despawns_bodies_produces_identical_snapshot_sequences() {
+        // Despawn changes the length of the body list mid-run, which is the
+        // same class of divergence combat risks and arrives by a different
+        // route: a `retain` whose predicate read anything outside level data,
+        // or that ran at a different point in the tick on one pass than on
+        // another, would show up here and nowhere else.
+        assert_deterministic(&kill_bound_scene(), 300, kill_bound_run);
+    }
+
+    #[test]
+    fn the_kill_bound_script_really_despawns_everything() {
+        // Guards the test above from passing vacuously, the same way the slam
+        // run's guard does. A script that flung nothing far enough would be
+        // perfectly deterministic and would assert nothing about despawn.
+        let trace = record(&kill_bound_scene(), 300, kill_bound_run);
+        let before = trace
+            .first()
+            .expect("a trace has a first tick")
+            .bodies
+            .len();
+        assert_eq!(before, 4, "one hero and three Enemies");
+
+        // Nothing in this scene can be destroyed: the Enemies a sketch spawns
+        // carry 100 Toughness and the fastest thing here carries 90 momentum,
+        // so an emptied trace can only be the Kill Bound's work.
+        let after = trace.last().expect("a trace has a last tick").bodies.len();
+        assert_eq!(after, 0, "every body should have left the bound");
+
+        // And they left on different ticks rather than all at once, so the
+        // trace really does carry several changes of body count.
+        let counts: Vec<usize> = trace.iter().map(|s| s.bodies.len()).collect();
+        let drops = counts.windows(2).filter(|w| w[1] < w[0]).count();
+        assert!(
+            drops >= 2,
+            "the bodies should leave on separate ticks, got counts {counts:?}"
         );
     }
 
