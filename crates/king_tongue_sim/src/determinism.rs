@@ -34,6 +34,22 @@ pub type Script = fn(tick: u64, world: &mut World);
 /// around it does not change.
 pub fn no_input(_tick: u64, _world: &mut World) {}
 
+/// Launches the hero across a line of Enemies hard enough to cover all three of
+/// ADR-0011's impact bands in one run.
+///
+/// The hero's momentum is assigned rather than earned by Swinging, which is what
+/// lets combat be scripted before a Tongue exists. The first Enemy is a one-shot
+/// and each impact drains the hero, so later Enemies are chipped and the last of
+/// them is only Kicked: destruction, a spent pool, and a repel all appear in one
+/// trace, and destruction is the case most likely to diverge because it changes
+/// the body count mid-run.
+pub fn slam_run(tick: u64, world: &mut World) {
+    if tick == 0 {
+        let hero = world.hero_id();
+        world.place(hero, Vec2::new(0.5, 2.5), Vec2::new(120.0, 0.0));
+    }
+}
+
 /// Runs `ticks` Sim Ticks and returns every `Snapshot` along the way, starting
 /// with the one from before any tick ran.
 pub fn record(level: &Level, ticks: u32, script: Script) -> Vec<Snapshot> {
@@ -176,6 +192,46 @@ mod tests {
         // ADR-0002 and ADR-0007 were bought for exactly this property. Without
         // it a regression is anecdotal rather than reproducible.
         assert_deterministic(&scene(), 300, no_input);
+    }
+
+    /// A line of Enemies at the hero's height, with a floor under everything.
+    /// `slam_run` launches the hero along the row.
+    fn combat_scene() -> Level {
+        Level::from_ascii(
+            "
+            .........
+            @.eeeee..
+            .........
+            #########
+            ",
+        )
+    }
+
+    #[test]
+    fn a_scripted_slam_run_produces_identical_snapshot_sequences() {
+        // Combat is where determinism is easiest to lose: an impact removes a
+        // body mid-run, so the body list changes length and anything that
+        // depended on iteration order or on a reused `EntityId` diverges here
+        // and nowhere else.
+        assert_deterministic(&combat_scene(), 300, slam_run);
+    }
+
+    #[test]
+    fn the_slam_run_script_really_destroys_enemies() {
+        // Guards the test above from passing vacuously. A script that failed to
+        // land a single impact would still be perfectly deterministic, and the
+        // combat trace would be asserting nothing about combat.
+        let trace = record(&combat_scene(), 300, slam_run);
+        let before = trace
+            .first()
+            .expect("a trace has a first tick")
+            .bodies
+            .len();
+        let after = trace.last().expect("a trace has a last tick").bodies.len();
+        assert!(
+            after < before,
+            "the scripted run destroyed nothing: {before} bodies throughout"
+        );
     }
 
     #[test]
