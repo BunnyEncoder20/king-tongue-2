@@ -232,7 +232,19 @@ pub fn run() {
         // ADR-0002 requires live in the `World`, which keeps them in step with
         // the ticks that produced them.
         let mut view = Snapshot::default();
-        let mut claimed: [Option<u64>; sim::MAX_TONGUES] = [None; sim::MAX_TONGUES];
+        // Likewise reused. Ten fingers is more than Android reports and far
+        // more than ADR-0006 can use.
+        let mut touches: Vec<sim::TouchSample> = Vec::with_capacity(10);
+
+        // The Camera origin a touch is converted through is the one that was on
+        // screen when the finger landed, which is last frame's. That is the
+        // honest answer rather than a convenience: the player aimed at what
+        // they could see, and the frame they aimed at has already been drawn.
+        let mut screen = macroquad::math::Vec2::new(
+            macroquad::window::screen_width(),
+            macroquad::window::screen_height(),
+        );
+        let mut origin = camera_origin(world.snapshot(), hero, screen);
 
         loop {
             // Wall-clock time enters the simulation here and nowhere else.
@@ -240,7 +252,11 @@ pub fn run() {
             // resume from suspend from running thousands of ticks in one frame.
             let ticks = accumulator.feed(macroquad::time::get_frame_time());
 
-            let _intents = poll_gestures(&mut claimed);
+            // Input enters the simulation here and nowhere else, and it enters
+            // raw. A Tongue fired now appears in the Snapshot the next Sim Tick
+            // writes, so it is drawn from the first tick it exists for.
+            collect_touches(origin, &mut touches);
+            world.apply_touches(&touches);
 
             for _ in 0..ticks {
                 world.step();
@@ -254,12 +270,14 @@ pub fn run() {
             );
 
             macroquad::window::clear_background(macroquad::color::BLACK);
-            let screen = macroquad::math::Vec2::new(
+            screen = macroquad::math::Vec2::new(
                 macroquad::window::screen_width(),
                 macroquad::window::screen_height(),
             );
-            // The Camera follows the interpolated hero, per ADR-0013.
-            let origin = camera_origin(&view, hero, screen);
+            // The Camera follows the interpolated hero, per ADR-0013. Kept for
+            // the next frame's touch conversion as well as this frame's
+            // drawing, so a tap is read against the view it was aimed at.
+            origin = camera_origin(&view, hero, screen);
             draw_terrain(&level.static_terrain, origin);
             draw_frame(&view, origin);
             macroquad::window::next_frame().await;
@@ -267,18 +285,37 @@ pub fn run() {
     });
 }
 
-/// Reads the current touch set into Gesture intents.
+/// Converts Macroquad's touch set into the Core Sim's platform-neutral one.
 ///
-/// Three constraints confirmed by the ticket #2 research, each of which is a bug
-/// if ignored: `touches()` collects from a `HashMap` so iteration order is not
-/// stable between frames and entries must be keyed by `id` rather than by index;
-/// `Ended` and `Cancelled` are visible for exactly one frame; and a held finger
-/// reports `Stationary`, never `Moved`.
+/// This is the entire input job of the Shell, and the absence of anything else
+/// here is the point. Which finger claims which Tongue slot, what a third
+/// concurrent touch does, which surface a tap Attaches to, and whether a lifted
+/// finger Releases anything are all decisions behind `World::apply_touches`,
+/// where they are headless-testable. The spec makes that a standing constraint:
+/// the Shell is untested by design, so a conditional here that decided a game
+/// outcome would be a defect.
 ///
-/// Slot assignment: the first `Started` id claims a free slot, later ids take the
-/// second, and any third concurrent id is discarded per ADR-0006.
-pub fn poll_gestures(_claimed: &mut [Option<u64>; sim::MAX_TONGUES]) -> Vec<sim::GestureIntent> {
-    // Gesture state machine lands with the level data format work; the frame
-    // contract it hangs off is settled here.
-    Vec::new()
+/// What remains is platform conversion. The phase mapping is a rename between
+/// two identical enums, and the position mapping is screen pixels to world
+/// units through the Camera origin. Neither looks at game state.
+///
+/// Keyed by `id` and never by position in the set: `touches()` collects from a
+/// `HashMap`, so its iteration order is not stable between frames. Writing into
+/// a caller-owned buffer so polling allocates nothing per frame.
+pub fn collect_touches(origin: macroquad::math::Vec2, out: &mut Vec<sim::TouchSample>) {
+    use macroquad::input::TouchPhase as Mq;
+    out.clear();
+    for touch in macroquad::input::touches() {
+        out.push(sim::TouchSample {
+            id: touch.id,
+            phase: match touch.phase {
+                Mq::Started => sim::TouchPhase::Started,
+                Mq::Moved => sim::TouchPhase::Moved,
+                Mq::Stationary => sim::TouchPhase::Stationary,
+                Mq::Ended => sim::TouchPhase::Ended,
+                Mq::Cancelled => sim::TouchPhase::Cancelled,
+            },
+            pos: from_screen(touch.position, origin),
+        });
+    }
 }

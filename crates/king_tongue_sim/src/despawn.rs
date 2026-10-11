@@ -211,6 +211,49 @@ mod tests {
         }
 
         #[test]
+        fn a_despawned_hero_takes_its_tongues_out_of_the_snapshot_with_it() {
+            // A despawned body must not be drawn, and a Tongue drawn from where
+            // the hero used to be is the same body still on screen under
+            // another name. The Shell draws whatever `Snapshot.tongues` holds
+            // and is not allowed a branch to decide otherwise, so the absence
+            // has to be the Core Sim's doing.
+            let bound = Aabb::new(Vec2::new(5.0, 5.0), Vec2::new(5.0, 5.0));
+            let level = Level {
+                world_bounds: bound,
+                // Something to Attach to, directly above the hero.
+                static_terrain: vec![Aabb::new(Vec2::new(5.0, 9.0), Vec2::new(5.0, 0.5))],
+                player_spawn: Vec2::new(5.0, 5.0),
+                enemy_spawns: vec![],
+            };
+            level.validate().expect("fixture must be a valid level");
+
+            let mut world = World::from_level(&level);
+            let hero = world.hero_id();
+            world.apply_touches(&[crate::input::TouchSample {
+                id: 1,
+                phase: crate::input::TouchPhase::Started,
+                pos: Vec2::new(5.0, 9.0),
+            }]);
+            world.step();
+            assert!(
+                !world.snapshot().tongues.is_empty(),
+                "the fixture must land a Tongue, or this asserts nothing"
+            );
+
+            // Flung sideways out of the bound while still Attached.
+            world.place(hero, Vec2::new(5.0, 5.0), Vec2::new(90.0, 0.0));
+            for _ in 0..60 {
+                world.step();
+            }
+
+            assert!(world.snapshot().body(hero).is_none(), "the hero despawned");
+            assert!(
+                world.snapshot().tongues.is_empty(),
+                "a Tongue must not be drawn from a hero that is no longer there"
+            );
+        }
+
+        #[test]
         fn the_bound_is_the_one_the_level_declared_and_not_a_fixed_distance() {
             // The closest a headless test can come to asserting "never the
             // viewport". Two runs identical in every respect except the

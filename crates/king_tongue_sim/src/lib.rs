@@ -17,11 +17,15 @@ pub mod despawn;
 #[cfg(any(test, feature = "test-util"))]
 pub mod determinism;
 pub mod frame;
+pub mod input;
 pub mod level;
+pub mod tongue;
 pub mod world;
 
 pub use frame::{Accumulator, Body, BodyKind, Snapshot, TongueLine, MAX_CATCHUP_TICKS};
+pub use input::{GestureTracker, TouchPhase, TouchSample};
 pub use level::{Aabb, EnemySpawn, Level, LevelError};
+pub use tongue::Tongue;
 pub use world::World;
 
 use glam::Vec2;
@@ -52,6 +56,15 @@ pub const DEFAULT_FORCE_CEILING: f32 = 1200.0;
 /// usable 0.1 to 0.25 band. Undamped never settles; critically damped kills the snap.
 pub const DEFAULT_DAMPING: f32 = 3.0;
 
+/// The baseline hero's Tongue strength: Hooke's `k`, in force per unit of Stretch.
+///
+/// A per-hero parameter and not a character system, same as `mass`. ADR-0007
+/// measured explicit Euler capping out at 3 where the baseline hero needs this,
+/// which is the whole reason the integrator is Velocity Verlet. The stability
+/// bound is [`max_stable_pull_strength`], roughly 14,400 at mass 1, so this
+/// leaves two orders of magnitude of headroom for device tuning.
+pub const DEFAULT_PULL_STRENGTH: f32 = 40.0;
+
 /// At most two Tongues, per ADR-0006. A third concurrent touch id is discarded.
 pub const MAX_TONGUES: usize = 2;
 
@@ -70,15 +83,13 @@ pub enum Anchor {
     Movable(EntityId),
 }
 
-/// A Gesture's effect, as the Shell reports it. The Shell produces intents; it
-/// never mutates simulation state. ADR-0006: a tap fires, a second tap Releases.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum GestureIntent {
-    /// Fire a Tongue along this unit vector from the hero.
-    Fire { slot: u8, direction: Vec2 },
-    /// Release the Tongue in this slot.
-    Release { slot: u8 },
-}
+// A `GestureIntent` enum used to live here, for the Shell to build and the Core
+// Sim to consume. It is gone, and deliberately. Under the `World` seam the Shell
+// reports raw [`TouchSample`]s and the Gesture tracker decides what they mean,
+// so an intent type in between would have had to be built by the Shell out of
+// rules that no longer live there: which slot a tap claims, and whether a
+// second tap fires or Releases. Those are exactly the decisions the seam exists
+// to keep out of an untested crate.
 
 /// Stable identity for anything the Shell has to draw, so adding a body to the
 /// Core Sim cannot silently fail to render. The interpolation contract is #7.

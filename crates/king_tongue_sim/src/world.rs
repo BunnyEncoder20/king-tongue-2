@@ -8,9 +8,14 @@
 
 use crate::combat;
 use crate::despawn;
-use crate::frame::{Body, BodyKind, Snapshot};
+use crate::frame::{Body, BodyKind, Snapshot, TongueLine};
+use crate::input::{self, GestureTracker, TouchPhase, TouchSample};
 use crate::level::{Aabb, Level};
-use crate::{EntityId, DEFAULT_PLAYER_MASS, DT, GRAVITY, PLAYER_RADIUS};
+use crate::tongue::{self, Pulls, Tongue, Tongues};
+use crate::{
+    Anchor, EntityId, DEFAULT_PLAYER_MASS, DEFAULT_PULL_STRENGTH, DT, GRAVITY, MAX_TONGUES,
+    PLAYER_RADIUS,
+};
 use glam::Vec2;
 
 /// How many times one Sim Tick's motion may be redirected by a surface.
@@ -73,6 +78,17 @@ pub struct World {
     /// viewport could leak into. See [`crate::despawn`].
     kill_bound: Aabb,
     hero: EntityId,
+    /// The hero's Tongue slots. Indexed by slot, so a Tongue's slot and its
+    /// position can never disagree.
+    tongues: Tongues,
+    /// Which finger currently drives which slot. Input state rather than
+    /// simulation state, but it lives here because ADR-0006 makes attachment
+    /// outlast the Gesture that created it, so the two have to be decided
+    /// together and the Shell must own neither.
+    gestures: GestureTracker,
+    /// Hooke's `k` for the hero's Tongues. A per-hero parameter like `mass`,
+    /// not a character system.
+    hero_pull_strength: f32,
     /// Monotonic. Never reused within a run, because interpolation matches
     /// bodies on identity and a recycled id would blend two different bodies
     /// into each other.
@@ -94,6 +110,9 @@ impl World {
             static_terrain: level.static_terrain.clone(),
             kill_bound: level.world_bounds,
             hero: EntityId(0),
+            tongues: [None; MAX_TONGUES],
+            gestures: GestureTracker::new(),
+            hero_pull_strength: DEFAULT_PULL_STRENGTH,
             next_id: 0,
             tick: 0,
             current: Snapshot::default(),
@@ -129,7 +148,7 @@ impl World {
             });
         }
 
-        write_snapshot(world.tick, &world.bodies, &mut world.current);
+        world.write_current_snapshot();
         world.previous.clone_from(&world.current);
         world
     }
@@ -182,7 +201,12 @@ impl World {
         for i in 0..self.bodies.len() {
             let body = self.bodies[i];
 
-            let a0 = body_force(&body) / body.mass;
+            // Resolved once per body per tick, before either evaluation, and
+            // `Copy`. Both evaluations therefore see the same Anchors, and
+            // neither can reach the `World` to look one up.
+            let pulls = self.pulls_on(body.id);
+
+            let a0 = body_force(&body, pulls) / body.mass;
             let target = body.pos + body.vel * DT + 0.5 * a0 * DT * DT;
 
             // Terrain is a constraint on motion and not a force, which is what
@@ -195,7 +219,7 @@ impl World {
             // `body_force` takes a state by value and can touch nothing else.
             let mut probe = body;
             probe.pos = pos;
-            let a1 = body_force(&probe) / body.mass;
+            let a1 = body_force(&probe, pulls) / body.mass;
 
             // Cancelling after the velocity half-step and not before is
             // load-bearing: the half-step adds another tick of gravity, and
@@ -229,7 +253,155 @@ impl World {
         // never the same tick. The buffers are swapped rather than rebuilt, so
         // the snapshot vectors keep their capacity instead of allocating.
         core::mem::swap(&mut self.previous, &mut self.current);
-        write_snapshot(self.tick, &self.bodies, &mut self.current);
+        self.write_current_snapshot();
+    }
+
+    /// Feeds this frame's raw touches in.
+    ///
+    /// Everything about which finger does what is inside: slot claiming, the
+    /// third concurrent finger, and the ray cast that picks the Anchor. The
+    /// Shell converts a Macroquad `Touch` into a [`TouchSample`] and calls this,
+    /// which is the whole of its input job. ADR-0001 and the spec's standing
+    /// constraint: a conditional in the Shell that decided a game outcome would
+    /// be a defect, because the Shell is untested by design.
+    ///
+    /// Call this between Sim Ticks. A Tongue fired here appears in the
+    /// [`Snapshot`] the next [`World::step`] writes, never retroactively in the
+    /// one already published for a tick that has been simulated.
+    pub fn apply_touches(&mut self, touches: &[TouchSample]) {
+        // Claims are given up first, and in the same call they are seen.
+        // `Ended` and `Cancelled` are visible for exactly one frame, so there
+        // is no later chance to notice them. Doing this before any claim is
+        // what lets a finger that lifts this frame hand its slot to a finger
+        // that lands this frame.
+        for touch in touches {
+            if matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                // The end of a Gesture, not a Release: ADR-0006 makes
+                // attachment outlast the finger, so the Tongue stays. Macroquad
+                // flips every live touch to `Ended` when the app minimizes, and
+                // inferring Release from that would drop both Tongues on every
+                // suspend.
+                self.gestures.release_owner(touch.id);
+            }
+        }
+
+        // One Gesture per slot at most, so this cannot spin on a finger it
+        // keeps refusing, and the third concurrent finger is never reached.
+        for _ in 0..MAX_TONGUES {
+            let Some(touch) = input::next_gesture(touches, &self.gestures) else {
+                break;
+            };
+            let vacant = core::array::from_fn(|slot| self.tongues[slot].is_none());
+            let Some(slot) = self.gestures.claim(touch.id, vacant) else {
+                break;
+            };
+            self.fire(slot, touch.pos);
+        }
+    }
+
+    /// Hooke's `k` for the hero's Tongues.
+    pub fn hero_pull_strength(&self) -> f32 {
+        self.hero_pull_strength
+    }
+
+    /// Sets Hooke's `k` for the hero's Tongues.
+    ///
+    /// A tuning knob rather than a character system. The spec's device-tuning
+    /// work and the hero archetype roster both sit outside this slice; what this
+    /// exists for now is asserting that hang equilibrium tracks
+    /// `REST_LENGTH + m*g/k` as `k` varies, which is the measurable claim
+    /// ADR-0003 makes.
+    ///
+    /// Values at or above [`crate::max_stable_pull_strength`] diverge under any
+    /// integrator at the locked `DT` and reopen ADR-0002 rather than ADR-0007.
+    pub fn set_hero_pull_strength(&mut self, pull_strength: f32) {
+        self.hero_pull_strength = pull_strength;
+    }
+
+    /// Fires a Tongue from the hero toward `tapped`, if the ray meets anything.
+    ///
+    /// The Gesture's direction is the vector from the hero to the tapped point,
+    /// and the ray goes exactly along it. ADR-0012: the aim is never bent.
+    fn fire(&mut self, slot: u8, tapped: Vec2) {
+        let Some(hero) = self.body(self.hero) else {
+            return;
+        };
+        let from = hero.pos;
+        // A ray into open sky meets nothing and fires nothing. ADR-0012 says a
+        // fired Tongue always connects, which holds for an enclosed level; a
+        // sketch with open sky is a test fixture, and the honest answer there is
+        // that the slot stays empty rather than an Anchor being invented.
+        if let Some(point) = tongue::cast(from, tapped - from, &self.static_terrain) {
+            self.tongues[slot as usize] = Some(Tongue {
+                anchor: Anchor::Fixed(point),
+            });
+        }
+    }
+
+    /// Every Tongue pulling on one body this Sim Tick, with its Anchor resolved
+    /// to a world-space point.
+    fn pulls_on(&self, body: EntityId) -> Pulls {
+        let mut pulls = Pulls::default();
+        // Only the hero holds Tongues. The equal and opposite pull a Movable
+        // Anchor feels by mass ratio is ADR-0003's and arrives with the Enemy
+        // Anchor ticket; it will add to this, not replace it.
+        if body != self.hero {
+            return pulls;
+        }
+        for tongue in self.tongues.iter().flatten() {
+            if let Some(point) = self.anchor_point(tongue.anchor) {
+                pulls.push(point, self.hero_pull_strength);
+            }
+        }
+        pulls
+    }
+
+    /// Where an Anchor is right now.
+    fn anchor_point(&self, anchor: Anchor) -> Option<Vec2> {
+        match anchor {
+            Anchor::Fixed(point) => Some(point),
+            // Resolved by identity and never by slice position, so a spawn or a
+            // despawn elsewhere cannot silently re-point a Tongue. A body that
+            // has despawned resolves to nothing rather than to a stale
+            // position. Nothing fires at an Enemy yet: this ticket's ray cast
+            // tests `static_terrain` only.
+            Anchor::Movable(id) => self.body(id).map(|b| b.pos),
+        }
+    }
+
+    fn body(&self, id: EntityId) -> Option<&BodyState> {
+        self.bodies.iter().find(|b| b.id == id)
+    }
+
+    fn write_current_snapshot(&mut self) {
+        let lines = self.tongue_lines();
+        write_snapshot(self.tick, &self.bodies, &lines, &mut self.current);
+    }
+
+    /// The Attached Tongues as the Shell draws them: hero to Anchor.
+    fn tongue_lines(&self) -> [Option<TongueLine>; MAX_TONGUES] {
+        let from = self.body(self.hero).map(|b| b.pos);
+        core::array::from_fn(|slot| {
+            let tongue = self.tongues[slot]?;
+            Some(TongueLine {
+                slot: slot as u8,
+                from: from?,
+                to: self.anchor_point(tongue.anchor)?,
+                anchor_id: tongue::anchor_id(tongue.anchor),
+            })
+        })
+    }
+
+    /// Reads a body's velocity, for headless tests.
+    ///
+    /// Gated for the same reason as [`World::place`], which is the companion
+    /// that writes it. Velocity is absent from the [`Snapshot`] because the
+    /// Shell has no use for it, but an energy budget cannot be computed without
+    /// it, and deriving it from two snapshot positions would fold the
+    /// integrator's own discretisation into the number being checked.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn body_velocity(&self, id: EntityId) -> Option<Vec2> {
+        self.body(id).map(|b| b.vel)
     }
 
     /// Resolves the hero's pass over this Sim Tick against every Enemy, and
@@ -313,12 +485,14 @@ impl World {
 /// body state and returns a vector, and it can reach nothing else: no `&mut`,
 /// no `&World`, no clock, no randomness.
 ///
-/// Every force added later, the Tongue spring first, goes here under the same
-/// rule.
-fn body_force(body: &BodyState) -> Vec2 {
+/// Every force added later goes here under the same rule. The Tongue spring is
+/// the first, and it is why `pulls` is passed by value: the Anchors are resolved
+/// before either evaluation, so this cannot reach the `World` to look one up and
+/// cannot observe a change one evaluation made to the other.
+fn body_force(body: &BodyState, pulls: Pulls) -> Vec2 {
     // Gravity, scaled by mass so the caller can divide by mass uniformly and
     // every force in this function means the same thing.
-    body.mass * GRAVITY
+    body.mass * GRAVITY + pulls.force(body.pos, body.vel)
 }
 
 /// The surfaces a body ended a Sim Tick touching.
@@ -548,7 +722,12 @@ fn crossing(origin: Vec2, motion: Vec2, aabb: Aabb, radius: f32) -> Option<(f32,
 /// A free function rather than a method so the caller can lend `bodies`
 /// immutably and `out` mutably at once, which keeps the snapshot buffers and
 /// their capacity across ticks instead of reallocating per tick.
-fn write_snapshot(tick: u64, bodies: &[BodyState], out: &mut Snapshot) {
+fn write_snapshot(
+    tick: u64,
+    bodies: &[BodyState],
+    tongues: &[Option<TongueLine>],
+    out: &mut Snapshot,
+) {
     out.tick = tick;
     out.bodies.clear();
     out.tongues.clear();
@@ -560,11 +739,18 @@ fn write_snapshot(tick: u64, bodies: &[BodyState], out: &mut Snapshot) {
             facing: b.facing,
         });
     }
+    // Only Attached Tongues appear. An empty slot is absent rather than present
+    // and degenerate, because the frame contract draws whatever it is given and
+    // treats a slot missing from the previous snapshot as a fresh Attach to
+    // snap to.
+    out.tongues.extend(tongues.iter().flatten().copied());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::{DEFAULT_DAMPING, REST_LENGTH};
 
     /// The hero as the seam exposes it: looked up by identity, never by slice
     /// position, because spawn order is not part of the contract.
@@ -573,6 +759,74 @@ mod tests {
             .snapshot()
             .body(world.hero_id())
             .expect("the hero must be in every snapshot")
+    }
+
+    /// A room with a surface on every side, so a ray in any direction meets
+    /// terrain. ADR-0012 assumes exactly this: every surface is anchorable, so
+    /// the aim never needs to be bent.
+    ///
+    /// Walls at `x = 1` and `x = 8`, floor top at `y = 1`, ceiling bottom at
+    /// `y = 4`, hero at `(4.5, 2.5)`.
+    ///
+    /// Written flush to the left margin deliberately. `from_ascii` counts one
+    /// character as one world unit from column zero, leading spaces included,
+    /// so an indented sketch is the same scene shifted right by its own
+    /// indentation and none of the coordinates above would hold.
+    fn room() -> Level {
+        Level::from_ascii(
+            "\
+#########
+#.......#
+#...@...#
+#.......#
+#########
+",
+        )
+    }
+
+    /// A single Anchor surface in open space, for measuring the spring without
+    /// a floor or a wall contributing anything.
+    ///
+    /// Ceiling bottom at `y = 9.5`, narrow enough that a Swing beneath it never
+    /// reaches it. The hero starts at `(0, spawn_y)`, so `9.5 - spawn_y` is the
+    /// Tongue's length at the moment it Attaches.
+    fn open_sky(spawn_y: f32) -> Level {
+        let level = Level {
+            world_bounds: Aabb::new(Vec2::new(0.0, 0.0), Vec2::splat(500.0)),
+            static_terrain: vec![Aabb::new(Vec2::new(0.0, 10.0), Vec2::new(0.5, 0.5))],
+            player_spawn: Vec2::new(0.0, spawn_y),
+            enemy_spawns: vec![],
+        };
+        level.validate().expect("fixture must be a valid level");
+        level
+    }
+
+    /// Taps at a world point, as one finger going down.
+    fn tap(world: &mut World, id: u64, at: Vec2) {
+        world.apply_touches(&[TouchSample {
+            id,
+            phase: TouchPhase::Started,
+            pos: at,
+        }]);
+    }
+
+    /// Taps in a direction from wherever the hero is.
+    fn tap_toward(world: &mut World, id: u64, direction: Vec2) {
+        let from = hero(world).pos;
+        tap(world, id, from + direction);
+    }
+
+    /// Fires a Tongue and returns where it Attached, failing if it did not.
+    fn attach(world: &mut World, direction: Vec2) -> Vec2 {
+        tap_toward(world, 1, direction);
+        world.step();
+        let tongues = &world.snapshot().tongues;
+        assert_eq!(
+            tongues.len(),
+            1,
+            "a tap toward {direction:?} must Attach exactly one Tongue"
+        );
+        tongues[0].to
     }
 
     #[test]
@@ -653,18 +907,40 @@ mod tests {
         // snapshot rebuilt from scratch each tick would allocate 60 times a
         // second forever, which nothing would fail on and a profiler would
         // find eventually.
-        let level = Level::from_ascii("..e.@..e.\n.........\n#########\n");
-        let mut world = World::from_level(&level);
+        // Both buffers, with Tongues Attached: the Tongue list is rebuilt every
+        // tick from the hero's slots, so it is the same hazard as the body list
+        // and was not covered while nothing could Attach.
+        let mut world = World::from_level(&room());
+        let from = hero(&world).pos;
+        world.apply_touches(&[
+            TouchSample {
+                id: 1,
+                phase: TouchPhase::Started,
+                pos: from + Vec2::Y,
+            },
+            TouchSample {
+                id: 2,
+                phase: TouchPhase::Started,
+                pos: from + Vec2::X,
+            },
+        ]);
         world.step();
         world.step();
-        let capacity = world.snapshot().bodies.capacity();
+        assert_eq!(world.snapshot().tongues.len(), MAX_TONGUES);
+        let bodies = world.snapshot().bodies.capacity();
+        let tongues = world.snapshot().tongues.capacity();
         for _ in 0..200 {
             world.step();
         }
         assert_eq!(
             world.snapshot().bodies.capacity(),
-            capacity,
-            "snapshot buffers must not grow per tick"
+            bodies,
+            "the body buffer must not grow per tick"
+        );
+        assert_eq!(
+            world.snapshot().tongues.capacity(),
+            tongues,
+            "the Tongue buffer must not grow per tick"
         );
     }
 
@@ -842,6 +1118,525 @@ mod tests {
         assert!(
             (end.y - start.y).abs() < 1e-5,
             "should have stayed on the floor, got {end:?}"
+        );
+    }
+
+    #[test]
+    fn swinging_along_a_tiled_floor_does_not_catch_on_a_seam() {
+        // The same defect as the `sweep` test above, provoked through the
+        // public API now that something can move the hero sideways. That test
+        // asserts the geometry; this one asserts the player-visible
+        // consequence, which is that a Swing along the ground does not stop
+        // dead at every tile boundary.
+        //
+        // The hero starts at rest on a tiled floor with a wall to its right,
+        // and Attaches to that wall at exactly its own height, so the pull is
+        // purely horizontal and the floor contact is the only thing that could
+        // interfere.
+        // Flush left, as in `room`: an indented sketch is the same scene moved
+        // sideways, and the wall's face below is an absolute coordinate.
+        let level = Level::from_ascii(
+            "\
+..........#
+..........#
+@.........#
+###########
+",
+        );
+        let mut world = World::from_level(&level);
+        let start = hero(&world).pos;
+        let anchor = attach(&mut world, Vec2::X);
+        assert_eq!(
+            anchor,
+            Vec2::new(10.0, start.y),
+            "the Anchor must be the wall at the hero's own height"
+        );
+
+        // Ten ticks, because the pull is strong enough to cover the room: by
+        // tick 18 the hero is against the far wall, and a contact with the
+        // Anchor's own surface would stop the slide for an honest reason and
+        // mask the one this test is looking for.
+        let mut previous = hero(&world).pos;
+        for tick in 0..10 {
+            world.step();
+            let now = hero(&world).pos;
+            assert!(
+                now.x > previous.x,
+                "caught on a tile seam at tick {tick}: {previous:?} then {now:?}"
+            );
+            assert!(
+                (now.y - start.y).abs() < 1e-3,
+                "left the floor at tick {tick}: {now:?}"
+            );
+            previous = now;
+        }
+        assert!(
+            previous.x - start.x > 3.0,
+            "expected to cross several tile seams, only reached {previous:?}"
+        );
+    }
+
+    #[test]
+    fn a_tap_fires_a_tongue_that_attaches_to_the_surface_it_points_at() {
+        let mut world = World::from_level(&room());
+        let start = hero(&world).pos;
+        assert!(
+            world.snapshot().tongues.is_empty(),
+            "nothing is Attached before a Gesture"
+        );
+
+        let anchor = attach(&mut world, Vec2::new(0.0, 5.0));
+        assert_eq!(
+            anchor,
+            Vec2::new(start.x, 4.0),
+            "straight up must Attach to the ceiling directly overhead"
+        );
+
+        let line = world.snapshot().tongues[0];
+        assert_eq!(line.slot, 0, "the first Gesture claims the first slot");
+        assert_eq!(
+            line.from,
+            hero(&world).pos,
+            "the Tongue is drawn from where the hero is now"
+        );
+        assert_eq!(
+            line.anchor_id, None,
+            "terrain is a Fixed Anchor and has no body"
+        );
+    }
+
+    #[test]
+    fn every_surface_is_anchorable_including_the_floor_and_the_lower_walls() {
+        // ADR-0012 calls universal anchorability load-bearing rather than a
+        // simplification: Attaching downward to the floor is how descent speed
+        // is built, and the canonical approach to a tough ground Enemy is to
+        // hop up, Attach to the floor, and strike from above.
+        let cases = [
+            (Vec2::NEG_Y, Vec2::new(4.5, 1.0), "the floor below"),
+            (Vec2::X, Vec2::new(8.0, 2.5), "the wall to the right"),
+            (Vec2::NEG_X, Vec2::new(1.0, 2.5), "the wall to the left"),
+            (Vec2::Y, Vec2::new(4.5, 4.0), "the ceiling above"),
+        ];
+        for (direction, expected, what) in cases {
+            let mut world = World::from_level(&room());
+            let anchor = attach(&mut world, direction);
+            assert_eq!(anchor, expected, "failed to Attach to {what}");
+        }
+    }
+
+    #[test]
+    fn the_aim_is_never_bent_toward_a_closer_surface() {
+        // ADR-0012, through the seam. The hero stands in a room whose nearest
+        // surface by far is the floor one unit below, and taps at the ceiling
+        // three times further away. A tolerance cone, which an earlier version
+        // of the design carried and which a future reader will want back, would
+        // pick the floor.
+        let mut world = World::from_level(&room());
+        let anchor = attach(&mut world, Vec2::new(0.0, 5.0));
+        assert_eq!(anchor.y, 4.0, "the aim was bent downward: {anchor:?}");
+    }
+
+    #[test]
+    fn hang_equilibrium_matches_theory_across_pull_strengths() {
+        // ADR-0003's measurable claim: the hero hangs at REST_LENGTH + m*g/k,
+        // so a stronger pull hangs closer to the rest boundary and no hero ever
+        // gets inside it. Three values of k, each compared against the closed
+        // form rather than against a recorded number, with the error bound
+        // stated: 1e-3 world units, which is a thousandth of the hero's radius.
+        //
+        // The spread is deliberate. At k = 20 the hero is damped at zeta 0.335
+        // and barely overshoots; at k = 120 it is at zeta 0.137, overshoots far
+        // enough to carry the Tongue back inside its rest boundary, and has to
+        // settle through a slack phase where no restoring force exists at all.
+        // Both must land on the same formula.
+        const TOLERANCE: f32 = 1e-3;
+        for pull_strength in [20.0f32, 40.0, 120.0] {
+            let mut world = World::from_level(&open_sky(8.0));
+            world.set_hero_pull_strength(pull_strength);
+            let anchor = attach(&mut world, Vec2::Y);
+
+            for _ in 0..20_000 {
+                world.step();
+            }
+
+            let expected = REST_LENGTH + DEFAULT_PLAYER_MASS * GRAVITY.length() / pull_strength;
+            let measured = (anchor - hero(&world).pos).length();
+            assert!(
+                (measured - expected).abs() < TOLERANCE,
+                "at k {pull_strength} expected to hang at {expected}, measured {measured}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slack_tongue_leaves_the_hero_in_free_fall() {
+        // The first of ADR-0003's three zones: inside the rest boundary a
+        // Tongue is slack and applies nothing. A web never pushes, so an
+        // Attached but slack Tongue must be indistinguishable from no Tongue at
+        // all.
+        let level = open_sky(8.8);
+        let spawn = level.player_spawn;
+        let mut world = World::from_level(&level);
+        let anchor = attach(&mut world, Vec2::Y);
+        assert!(
+            (anchor - spawn).length() < REST_LENGTH,
+            "fixture must start inside the rest boundary"
+        );
+        assert_eq!(
+            world.snapshot().tongues.len(),
+            1,
+            "the Tongue must really be Attached, or this test proves nothing"
+        );
+
+        // One tick was spent Attaching, so this is tick 20 of the fall.
+        const TICKS: u32 = 20;
+        for _ in 1..TICKS {
+            world.step();
+        }
+
+        // The closed form, from the physics rather than from the code. Velocity
+        // Verlet is exact under constant acceleration, so a slack Tongue must
+        // leave this untouched to float accuracy.
+        let t = TICKS as f32 * DT;
+        let expected = spawn.y - 0.5 * GRAVITY.length() * t * t;
+        let after = hero(&world).pos;
+        assert!(
+            (after.y - expected).abs() < 1e-5,
+            "a slack Tongue changed the fall: expected {expected}, got {}",
+            after.y
+        );
+        assert_eq!(after.x, spawn.x, "a slack Tongue pulled sideways");
+        assert!(
+            (anchor - after).length() < REST_LENGTH,
+            "the fixture left the slack zone before the measurement ended"
+        );
+    }
+
+    #[test]
+    fn the_tongue_never_pushes_even_when_the_hero_races_inward() {
+        // The clamp in the force law, through the seam. The hero is fired at
+        // its own Anchor fast enough that the damping term alone is four times
+        // the spring term, so an unclamped force would invert and shove the
+        // hero back down hard. Clamped, the only force left is gravity, and the
+        // hero travels exactly as far as a thrown stone would.
+        let mut world = World::from_level(&open_sky(0.0));
+        let anchor = attach(&mut world, Vec2::Y);
+        let start = hero(&world).pos;
+
+        let inward = 500.0;
+        let stretch = (anchor - start).length() - REST_LENGTH;
+        assert!(
+            DEFAULT_DAMPING * inward > world.hero_pull_strength() * stretch,
+            "fixture must race in hard enough for damping to dominate"
+        );
+        world.place(world.hero_id(), start, Vec2::new(0.0, inward));
+
+        world.step();
+        let expected = start + Vec2::new(0.0, inward) * DT + 0.5 * GRAVITY * DT * DT;
+        let measured = hero(&world).pos;
+        assert!(
+            (measured - expected).length() < 1e-4,
+            "the spring pushed back: ballistic travel would end at {expected:?}, got {measured:?}"
+        );
+    }
+
+    #[test]
+    fn tangential_velocity_and_an_inward_pull_produce_a_bounded_swing() {
+        // The mechanic itself. Nothing in the simulation models a pendulum:
+        // the spring pulls inward, the hero's own momentum carries across it,
+        // and the Swing is what emerges. ADR-0003.
+        //
+        // The claim under test is that it stays bounded. An integrator that
+        // injected energy would not fail visibly for a few hundred ticks, so
+        // this runs a full minute of Sim Ticks and budgets the total energy,
+        //
+        //     E = 0.5*m*v^2 + m*g*y + 0.5*k*stretch^2
+        //
+        // which a one-way damped spring can only spend. The force ceiling never
+        // binds at this stretch, so that spring term is the exact potential and
+        // not an approximation of it.
+        let mut world = World::from_level(&open_sky(8.0));
+        let hero_id = world.hero_id();
+        let k = world.hero_pull_strength();
+        let anchor = attach(&mut world, Vec2::Y);
+        // Across the pull rather than along it, which is what makes the motion
+        // orbital rather than a bounce up and down the Tongue.
+        world.place(hero_id, hero(&world).pos, Vec2::new(2.5, 0.0));
+
+        let energy = |world: &World| {
+            let pos = hero(world).pos;
+            let vel = world.body_velocity(hero_id).expect("the hero is alive");
+            let stretch = ((anchor - pos).length() - REST_LENGTH).max(0.0);
+            0.5 * DEFAULT_PLAYER_MASS * vel.length_squared()
+                + DEFAULT_PLAYER_MASS * GRAVITY.length() * pos.y
+                + 0.5 * k * stretch * stretch
+        };
+
+        const TICKS: u32 = 3600;
+        let budget = energy(&world);
+        let (mut left, mut right) = (false, false);
+        let (mut late_left, mut late_right) = (false, false);
+        let mut furthest = 0.0f32;
+        for tick in 0..TICKS {
+            world.step();
+            let pos = hero(&world).pos;
+            assert!(pos.is_finite(), "diverged at tick {tick}: {pos:?}");
+            // 1e-3 of the budget: Velocity Verlet evaluates its second
+            // acceleration at the old velocity, which is not exactly
+            // symplectic, so a little drift is expected and a little is all
+            // that is allowed.
+            assert!(
+                energy(&world) <= budget * 1.001,
+                "energy grew at tick {tick}: budget {budget}, now {}",
+                energy(&world)
+            );
+            left |= pos.x < anchor.x - 0.5;
+            right |= pos.x > anchor.x + 0.5;
+            if tick > TICKS - 600 {
+                late_left |= pos.x < anchor.x;
+                late_right |= pos.x > anchor.x;
+            }
+            furthest = furthest.max((anchor - pos).length());
+        }
+
+        assert!(
+            left && right,
+            "the hero never swung across the Anchor, so this was a fall and not a Swing"
+        );
+        assert!(
+            furthest < 4.0,
+            "the Swing escaped: reached {furthest} from the Anchor"
+        );
+        // Damping is real, so some energy is gone by the end.
+        assert!(
+            energy(&world) < budget,
+            "a damped spring must have spent something over a minute of Swinging"
+        );
+        // And the hero is still Swinging, which is not a defect but the point.
+        // ADR-0003's damping term is `damping * radial_vel`, so it opposes
+        // motion along the Tongue and nothing else. A Swing is almost entirely
+        // across the Tongue, where the radial velocity is near zero, so the
+        // angular motion is barely damped at all and a minute of it does not
+        // die out under the player. That asymmetry is why the Tongue settles to
+        // a hang length when the hero is dropped straight down it and keeps
+        // orbiting when the hero arrives sideways, and it is worth knowing
+        // before anyone tunes `DEFAULT_DAMPING` expecting a Swing to decay.
+        assert!(
+            late_left && late_right,
+            "the Swing had died out, which radial damping alone cannot do"
+        );
+    }
+
+    #[test]
+    fn a_newly_attached_tongue_snaps_rather_than_blending() {
+        // Spec story 47: a Tongue that has just Attached must appear already
+        // connected rather than stretching out of nowhere. The Core Sim's half
+        // of that is leaving the slot absent from the previous snapshot, which
+        // is what makes the frame contract snap instead of lerping the far end
+        // in from a stale position.
+        let mut world = World::from_level(&room());
+        let anchor = attach(&mut world, Vec2::new(0.0, 5.0));
+        assert!(
+            world.previous_snapshot().tongues.is_empty(),
+            "the tick before the Attach must carry no Tongue in that slot"
+        );
+
+        let mut view = Snapshot::default();
+        for alpha in [0.0f32, 0.25, 0.5, 1.0] {
+            crate::frame::interpolate_into(
+                world.previous_snapshot(),
+                world.snapshot(),
+                alpha,
+                &mut view,
+            );
+            assert_eq!(
+                view.tongues[0].to, anchor,
+                "at alpha {alpha} the Tongue was drawn short of its Anchor"
+            );
+        }
+    }
+
+    #[test]
+    fn lifting_the_finger_does_not_release_an_attached_tongue() {
+        // ADR-0006, and the specific platform trap it names: Macroquad flips
+        // every live touch to `Ended` when the app minimizes. Under the earlier
+        // hold-to-Swing scheme that was a free Release on every suspend. Under
+        // discrete tap control attachment outlasts the Gesture, so the input
+        // layer must never infer Release from touch loss.
+        let mut world = World::from_level(&room());
+        attach(&mut world, Vec2::new(0.0, 5.0));
+
+        for phase in [TouchPhase::Ended, TouchPhase::Cancelled] {
+            world.apply_touches(&[TouchSample {
+                id: 1,
+                phase,
+                pos: Vec2::ZERO,
+            }]);
+            world.step();
+            assert_eq!(
+                world.snapshot().tongues.len(),
+                1,
+                "{phase:?} must not Release the Tongue"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_finger_fires_once_and_not_once_per_frame() {
+        // A held finger reports `Stationary` every frame, never `Moved`. If
+        // that re-fired, one thumb pressed on the screen would claim both slots
+        // on consecutive frames and the hero would be Attached twice from a
+        // single tap.
+        let mut world = World::from_level(&room());
+        tap_toward(&mut world, 1, Vec2::new(0.0, 5.0));
+        for _ in 0..30 {
+            world.apply_touches(&[TouchSample {
+                id: 1,
+                phase: TouchPhase::Stationary,
+                pos: hero(&world).pos + Vec2::new(5.0, 0.0),
+            }]);
+            world.step();
+        }
+        assert_eq!(
+            world.snapshot().tongues.len(),
+            1,
+            "holding the finger down fired more than once"
+        );
+    }
+
+    #[test]
+    fn a_third_concurrent_finger_is_discarded() {
+        // ADR-0006 caps the hero at two Tongues. A stray touch while two
+        // fingers are already down must do nothing at all rather than something
+        // surprising, because it is the kind of accident that would otherwise
+        // cost a player a run.
+        let mut world = World::from_level(&room());
+        let from = hero(&world).pos;
+        let down = |id, aim: Vec2| TouchSample {
+            id,
+            phase: TouchPhase::Started,
+            pos: from + aim,
+        };
+        world.apply_touches(&[
+            down(1, Vec2::new(0.0, 5.0)),
+            down(2, Vec2::new(-5.0, 0.0)),
+            down(3, Vec2::new(5.0, 0.0)),
+        ]);
+        world.step();
+
+        let tongues = &world.snapshot().tongues;
+        assert_eq!(tongues.len(), MAX_TONGUES, "a third Tongue was Attached");
+        let slots: Vec<u8> = tongues.iter().map(|t| t.slot).collect();
+        assert_eq!(slots, vec![0, 1], "both slots must be filled exactly once");
+    }
+
+    #[test]
+    fn slot_assignment_does_not_depend_on_the_order_touches_arrive_in() {
+        // The regression this prevents is invisible until it desynchronises a
+        // replay. Macroquad's `touches()` collects from a `HashMap`, so two
+        // fingers landing in the same frame arrive in whatever order that
+        // hashing produces. Taking them as given would assign slots by the
+        // platform's hashing, and the same two taps would produce a different
+        // Snapshot sequence between runs even though the physics agreed.
+        let ceiling = Vec2::new(0.0, 5.0);
+        let wall = Vec2::new(-5.0, 0.0);
+        let traces: Vec<Vec<TongueLine>> =
+            [[(7u64, ceiling), (3, wall)], [(3, wall), (7, ceiling)]]
+                .iter()
+                .map(|order| {
+                    let mut world = World::from_level(&room());
+                    let from = hero(&world).pos;
+                    let touches: Vec<TouchSample> = order
+                        .iter()
+                        .map(|(id, aim)| TouchSample {
+                            id: *id,
+                            phase: TouchPhase::Started,
+                            pos: from + *aim,
+                        })
+                        .collect();
+                    world.apply_touches(&touches);
+                    world.step();
+                    world.snapshot().tongues.clone()
+                })
+                .collect();
+
+        assert_eq!(traces[0].len(), MAX_TONGUES);
+        assert_eq!(
+            traces[0], traces[1],
+            "slot assignment followed the iteration order rather than the touch ids"
+        );
+    }
+
+    #[test]
+    fn a_tap_on_the_hero_itself_does_not_attach_anything() {
+        // Hostile input. A tap landing exactly on the hero is a zero-length aim
+        // vector, and normalizing that produces NaN, which fired into the level
+        // as an Anchor would poison every tick after it.
+        let mut world = World::from_level(&room());
+        let on_the_hero = hero(&world).pos;
+        tap(&mut world, 1, on_the_hero);
+        for _ in 0..60 {
+            world.step();
+        }
+        assert!(
+            world.snapshot().tongues.is_empty(),
+            "a directionless tap Attached something"
+        );
+        assert!(
+            hero(&world).pos.is_finite(),
+            "a directionless tap produced {:?}",
+            hero(&world).pos
+        );
+    }
+
+    #[test]
+    fn a_tap_into_open_sky_attaches_nothing_and_leaves_the_slot_free() {
+        // An open sketch has no surface in every direction, unlike the enclosed
+        // levels ADR-0012 assumes. Inventing an Anchor at some arbitrary range
+        // would be worse than Attaching nothing.
+        let mut world = World::from_level(&open_sky(8.0));
+        tap_toward(&mut world, 1, Vec2::NEG_Y);
+        world.step();
+        assert!(world.snapshot().tongues.is_empty());
+
+        // And the slot is still usable by the next tap, which is the part worth
+        // checking: a miss must not consume a Tongue.
+        world.apply_touches(&[TouchSample {
+            id: 1,
+            phase: TouchPhase::Ended,
+            pos: Vec2::ZERO,
+        }]);
+        let anchor = attach(&mut world, Vec2::Y);
+        assert_eq!(anchor, Vec2::new(0.0, 9.5));
+    }
+
+    #[test]
+    fn two_tongues_on_one_anchor_pull_harder_than_one() {
+        // Ticket #14 owns the exact ratios. What belongs here is that the sum
+        // happens at all, because a second Tongue that silently replaced the
+        // first would look identical in every single-Tongue test above.
+        let pulled = |tongues: usize| {
+            let mut world = World::from_level(&open_sky(0.0));
+            let from = hero(&world).pos;
+            let touches: Vec<TouchSample> = (0..tongues)
+                .map(|i| TouchSample {
+                    id: i as u64,
+                    phase: TouchPhase::Started,
+                    pos: from + Vec2::Y,
+                })
+                .collect();
+            world.apply_touches(&touches);
+            world.step();
+            assert_eq!(world.snapshot().tongues.len(), tongues);
+            hero(&world).pos.y - from.y
+        };
+
+        let one = pulled(1);
+        let two = pulled(2);
+        assert!(one > 0.0, "a single Tongue did not pull the hero up");
+        assert!(
+            two > one * 1.5,
+            "two Tongues on one Anchor pulled {two} against one Tongue's {one}"
         );
     }
 
