@@ -30,8 +30,15 @@ pub extern "C" fn quad_main() {
     run();
 }
 
-/// World units per screen pixel at the default zoom.
-const PIXELS_PER_UNIT: f32 = 24.0;
+/// Screen pixels per world unit: the Camera's fixed zoom.
+///
+/// ADR-0013 deliberately leaves the zoom factor open and calls this constant a
+/// placeholder, so this is a bound and not an answer. The bound it has to meet
+/// is that the whole level is never visible at once. At 64 pixels per unit even
+/// a 3840 pixel wide window shows 60 world units across, while the shipped
+/// scene's terrain spans 82 and its Kill Bound 160, so the player always sees a
+/// slice. Lowering this below roughly 48 breaks that on a wide desktop monitor.
+const PIXELS_PER_UNIT: f32 = 64.0;
 
 /// Converts a Core Sim position into Macroquad screen space.
 ///
@@ -90,6 +97,62 @@ fn draw_body(body: &sim::Body, origin: macroquad::math::Vec2) {
     // angle, so it is never reconstructed through atan2 and re-wrapped.
     let tip = to_screen(body.pos + body.facing * sim::PLAYER_RADIUS * 1.8, origin);
     macroquad::shapes::draw_line(p.x, p.y, tip.x, tip.y, 2.0, color::WHITE);
+}
+
+/// Where world-space origin lands on screen so that the hero sits in the middle
+/// of it.
+///
+/// This is the whole Camera, and ADR-0013 puts it here rather than in the Core
+/// Sim because it is view state: it changes what the player sees and never what
+/// the simulation computes.
+///
+/// It reads the **interpolated** snapshot and not the tick state. Following the
+/// raw tick position judders visibly on a high refresh rate panel even though
+/// the simulation underneath is correct, because the Camera would then step at
+/// 60Hz while the panel draws at 120.
+///
+/// Stateless, which is what ADR-0013 decided: position straight from the hero
+/// every frame, no damping and no lookahead. The ADR records why taking the
+/// damped escape hatch later would be legitimate.
+pub fn camera_origin(
+    view: &Snapshot,
+    hero: sim::EntityId,
+    screen: macroquad::math::Vec2,
+) -> macroquad::math::Vec2 {
+    let centre = screen * 0.5;
+    // Inverting `to_screen` for the hero's position: whatever origin puts the
+    // hero at the centre of the screen. The hero is in every snapshot the Core
+    // Sim produces, so the fallback is unreachable in practice; drawing the
+    // world origin at the centre is the inert choice, and it is a drawing
+    // fallback rather than a game rule.
+    view.body(hero).map_or(centre, |body| {
+        macroquad::math::Vec2::new(
+            centre.x - body.pos.x * PIXELS_PER_UNIT,
+            centre.y + body.pos.y * PIXELS_PER_UNIT,
+        )
+    })
+}
+
+/// Draws the level's static terrain.
+///
+/// Terrain is not in the `Snapshot` because it never moves, so the Shell draws
+/// it straight from the `Level` it loaded. Without it the hero falls and lands
+/// in a black void with nothing to land on, which is a rendering gap and not a
+/// simulation one.
+fn draw_terrain(terrain: &[sim::Aabb], origin: macroquad::math::Vec2) {
+    for aabb in terrain {
+        // Screen y grows downward, so a box's upper left on screen is its
+        // minimum x and its maximum y in the world.
+        let corner = to_screen(glam::Vec2::new(aabb.min().x, aabb.max().y), origin);
+        let size = aabb.half_extents * 2.0 * PIXELS_PER_UNIT;
+        macroquad::shapes::draw_rectangle(
+            corner.x,
+            corner.y,
+            size.x,
+            size.y,
+            macroquad::color::DARKGRAY,
+        );
+    }
 }
 
 fn draw_frame(view: &Snapshot, origin: macroquad::math::Vec2) {
@@ -156,11 +219,16 @@ pub fn run() {
             level.enemy_spawns.len()
         );
 
+        // The Core Sim owns every piece of state from here on. The Shell holds
+        // the clock, the touch slots, the interpolation buffer, and the Camera,
+        // and nothing else.
+        let mut world = sim::World::from_level(&level);
+        let hero = world.hero_id();
+
         let mut accumulator = Accumulator::new();
-        // The two snapshots ADR-0002 requires, plus a reused interpolation buffer
-        // so rendering allocates nothing per frame.
-        let mut previous = Snapshot::default();
-        let mut current = Snapshot::default();
+        // Reused so rendering allocates nothing per frame. The two snapshots
+        // ADR-0002 requires live in the `World`, which keeps them in step with
+        // the ticks that produced them.
         let mut view = Snapshot::default();
         let mut claimed: [Option<u64>; sim::MAX_TONGUES] = [None; sim::MAX_TONGUES];
 
@@ -173,20 +241,24 @@ pub fn run() {
             let _intents = poll_gestures(&mut claimed);
 
             for _ in 0..ticks {
-                // Rotate before stepping, so `previous` is always the tick before
-                // `current` and never the same tick.
-                core::mem::swap(&mut previous, &mut current);
-                // World stepping lands here. The Core Sim produces `current`.
-                current.tick = previous.tick.wrapping_add(1);
+                world.step();
             }
 
-            sim::frame::interpolate_into(&previous, &current, accumulator.alpha(), &mut view);
+            sim::frame::interpolate_into(
+                world.previous_snapshot(),
+                world.snapshot(),
+                accumulator.alpha(),
+                &mut view,
+            );
 
             macroquad::window::clear_background(macroquad::color::BLACK);
-            let origin = macroquad::math::Vec2::new(
-                macroquad::window::screen_width() * 0.5,
-                macroquad::window::screen_height() * 0.5,
+            let screen = macroquad::math::Vec2::new(
+                macroquad::window::screen_width(),
+                macroquad::window::screen_height(),
             );
+            // The Camera follows the interpolated hero, per ADR-0013.
+            let origin = camera_origin(&view, hero, screen);
+            draw_terrain(&level.static_terrain, origin);
             draw_frame(&view, origin);
             macroquad::window::next_frame().await;
         }

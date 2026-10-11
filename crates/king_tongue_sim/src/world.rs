@@ -680,4 +680,52 @@ mod tests {
         assert_eq!(unique.len(), 3, "identities must not be reused: {ids:?}");
         assert!(ids.contains(&world.hero_id()));
     }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn the_shipped_scene_drops_the_hero_onto_its_floor() {
+        // The tracer bullet, headless: the level file that actually ships, read
+        // as bytes and simulated, with the hero ending up at rest on the floor
+        // the file declares. Every sketched fixture above could be right while
+        // the shipped scene was unplayable, and nothing would have said so.
+        //
+        // Reading the file here is the test standing in for the Shell. The Core
+        // Sim still never touches the filesystem: it is handed bytes, exactly
+        // as ADR-0001 and ADR-0010 require.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/levels/test_scene.ron"
+        );
+        let bytes = std::fs::read(path).expect("the shipped level must be readable");
+        let level = Level::from_bytes(&bytes).expect("the shipped level must parse");
+
+        let mut world = World::from_level(&level);
+        let spawn = hero(&world).pos;
+        assert_eq!(spawn, level.player_spawn);
+
+        // The floor is the widest piece of terrain below the spawn point.
+        let floor_top = level
+            .static_terrain
+            .iter()
+            .filter(|t| t.max().y < spawn.y && t.contains(Vec2::new(spawn.x, t.centre.y)))
+            .map(|t| t.max().y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(floor_top.is_finite(), "the shipped scene has no floor");
+
+        // Moon gravity over 7 units takes about 2.9 seconds, so 600 ticks is
+        // the fall with room to settle.
+        for _ in 0..600 {
+            world.step();
+        }
+        let landed = hero(&world).pos;
+        assert!(
+            landed.y < spawn.y,
+            "the hero never fell: spawned at {spawn:?}, ended at {landed:?}"
+        );
+        assert!(
+            (landed.y - (floor_top + PLAYER_RADIUS)).abs() < 1e-3,
+            "expected to rest on the floor at y {}, got {landed:?}",
+            floor_top + PLAYER_RADIUS
+        );
+    }
 }
