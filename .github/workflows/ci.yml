@@ -1,0 +1,69 @@
+# The repo's first guardrail. Before this, nothing mechanically enforced the
+# architecture boundaries the ADRs describe.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  sim:
+    name: Core Sim (boundary, tests, lints)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # The load-bearing check. ADR-0001 is only real because this fails the
+      # build when the Core Sim grows a dependency.
+      - name: Core Sim dependency boundary (ADR-0001)
+        run: ./scripts/check-sim-deps.sh
+
+      # Must pass with no default features and no Android toolchain present:
+      # that is what makes determinism tests cheap (ADR-0001, ADR-0002).
+      - name: Headless Core Sim tests
+        run: cargo test -p king_tongue_sim --no-default-features
+
+      - name: Core Sim tests with serde
+        run: cargo test -p king_tongue_sim --features serde
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p king_tongue_sim --all-targets -- -D warnings
+
+  android:
+    name: Android cross-compile (both shipping ABIs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27
+      - run: cargo install cargo-ndk --locked
+
+      - name: Build Shell cdylib
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a --platform 24 -o ./android/jniLibs build --release -p king_tongue_shell --lib
+
+      # ADR-0005: miniquad declares quad_main and never defines it. Omitting the
+      # shim fails at RUNTIME with UnsatisfiedLinkError and no build error, so
+      # the symbol has to be asserted rather than assumed.
+      - name: Assert quad_main is exported
+        run: |
+          for abi in arm64-v8a armeabi-v7a; do
+            so="android/jniLibs/$abi/libking_tongue_shell.so"
+            count=$(nm -D --defined-only "$so" | grep -c ' quad_main$' || true)
+            if [ "$count" -ne 1 ]; then
+              echo "FAIL: $abi exports $count quad_main symbols, expected 1" >&2
+              echo "See ADR-0005: System.loadLibrary will throw UnsatisfiedLinkError." >&2
+              exit 1
+            fi
+            echo "OK: $abi exports quad_main"
+          done

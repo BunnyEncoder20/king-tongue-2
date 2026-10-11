@@ -1,0 +1,21 @@
+[package]
+name = "king_tongue_sim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The Core Sim. ADR-0001: glam and nothing else by default. No renderer, no
+# window, no engine types. ADR-0007: integration is Velocity Verlet.
+#
+# `serde` is optional and OFF by default, so the default dependency set stays
+# provably glam-only and `scripts/check-sim-deps.sh` can assert it. The Shell
+# turns it on to parse level data into these types.
+[dependencies]
+glam = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "glam/serde"]
