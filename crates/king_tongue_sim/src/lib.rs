@@ -81,15 +81,13 @@ pub enum Anchor {
     Movable(EntityId),
 }
 
-/// A Gesture's effect, as the Shell reports it. The Shell produces intents; it
-/// never mutates simulation state. ADR-0006: a tap fires, a second tap Releases.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum GestureIntent {
-    /// Fire a Tongue along this unit vector from the hero.
-    Fire { slot: u8, direction: Vec2 },
-    /// Release the Tongue in this slot.
-    Release { slot: u8 },
-}
+// A `GestureIntent` enum used to live here, for the Shell to build and the Core
+// Sim to consume. It is gone, and deliberately. Under the `World` seam the Shell
+// reports raw [`TouchSample`]s and the Gesture tracker decides what they mean,
+// so an intent type in between would have had to be built by the Shell out of
+// rules that no longer live there: which slot a tap claims, and whether a
+// second tap fires or Releases. Those are exactly the decisions the seam exists
+// to keep out of an untested crate.
 
 /// Stable identity for anything the Shell has to draw, so adding a body to the
 /// Core Sim cannot silently fail to render. The interpolation contract is #7.
