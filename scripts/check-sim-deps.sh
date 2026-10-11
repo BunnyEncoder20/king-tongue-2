@@ -14,13 +14,25 @@ EXPECTED="scripts/sim-deps.expected"
 ACTUAL="$(mktemp)"
 trap 'rm -f "$ACTUAL"' EXIT
 
+# The allowlist is crate NAMES only, deliberately normalised two ways:
+#
+#   - Local paths are stripped. `cargo tree` prints workspace members with their
+#     absolute path, so an unnormalised allowlist embeds whoever generated it and
+#     fails on every other machine, CI included.
+#   - Versions are stripped. This guard exists to catch a NEW dependency, not a
+#     patch bump. Pinning versions here would turn every `cargo update` into a
+#     spurious failure, and Cargo.lock is what holds versions.
 cargo tree \
   --package king_tongue_sim \
   --no-default-features \
   --edges normal \
   --prefix none \
   --no-dedupe \
-  2>/dev/null | sed 's/ (\*)$//' | sort -u > "$ACTUAL"
+  2>/dev/null \
+  | sed -E 's/ \(\*\)$//; s| \(/[^)]*\)||; s/ v[0-9][^ ]*$//' \
+  | sed -E 's/[[:space:]]+$//' \
+  | grep -v '^$' \
+  | sort -u > "$ACTUAL"
 
 if ! diff -u "$EXPECTED" "$ACTUAL"; then
   echo >&2

@@ -49,10 +49,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android, armv7-linux-androideabi
+      # Must match the NDK this project is locked to and developed against.
+      # An r27 pin here was a discrepancy: the .so would be built against a
+      # different NDK in CI than on a developer machine, so "works locally"
+      # would not imply "works in CI". If the action does not offer r30, that
+      # is the signal to bump the action or re-pin the project, not to let the
+      # two drift.
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
-          ndk-version: r27
+          ndk-version: r30
       - run: cargo install cargo-ndk --locked
 
       - name: Build Shell cdylib

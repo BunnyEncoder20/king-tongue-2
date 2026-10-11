@@ -179,9 +179,13 @@ impl Level {
         }
 
         Level {
+            // Half-extents are half the sketch, not the whole sketch. Passing
+            // full width and height here made every sketched level's kill bound
+            // twice its actual size, which no test caught because an oversized
+            // bound is permissive: nothing despawned that should have.
             world_bounds: Aabb::new(
                 Vec2::new(width * 0.5, height * 0.5),
-                Vec2::new(width, height),
+                Vec2::new(width * 0.5, height * 0.5),
             ),
             static_terrain,
             player_spawn,
@@ -211,6 +215,26 @@ mod tests {
             "enemy sits above the hero"
         );
         level.validate().expect("sketch should be valid");
+    }
+
+    #[test]
+    fn ascii_world_bounds_match_the_sketch_extent() {
+        // Regression: half-extents were set to the full width and height, so
+        // every sketched kill bound was twice the size of its sketch. An
+        // oversized bound is permissive, so nothing failed; it just quietly
+        // stopped despawning things at the edge.
+        let level = Level::from_ascii("#####\n..@..\n#####\n");
+        assert_eq!(level.world_bounds.min(), Vec2::new(0.0, 0.0));
+        assert_eq!(level.world_bounds.max(), Vec2::new(5.0, 3.0));
+        // Every sketched cell centre must sit inside the bound it generated.
+        for t in &level.static_terrain {
+            assert!(
+                level.world_bounds.contains(t.centre),
+                "terrain {:?} outside bounds",
+                t.centre
+            );
+        }
+        assert!(level.world_bounds.contains(level.player_spawn));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # King Tongue 2
 
-A 2D side-view Android game built entirely in Rust, reimplementing the core grapple mechanics of a tongue-based swinging brawler: attaching to the world, converting pendulum momentum into flight, and slamming enemies with that momentum.
+A 2D side-view Android game built entirely in Rust, reimplementing the core grapple mechanics of a tongue-based swinging brawler: attaching to the world, converting orbital momentum into flight, and slamming enemies with that momentum.
 
 ## Language
 
@@ -23,7 +23,7 @@ An Anchor that is itself a body with mass, such as an Enemy. Attaching exchanges
 _Avoid_: Dynamic anchor, enemy anchor
 
 **Attach**:
-The state of the Tongue being connected to an Anchor, holding the player at a bounded radius from it.
+The state of a Tongue being connected to an Anchor, pulling the player toward it. There is no bounded radius and no maximum length.
 _Avoid_: Latch, grab, hook on
 
 **Swing**:
@@ -57,6 +57,14 @@ _Avoid_: Vicious pull, wrecking ball, stunned, ragdoll
 **Enemy**:
 A body in the world that can be Slammed.
 _Avoid_: Mob, foe, NPC
+
+**Toughness**:
+An Enemy's resistance to being destroyed, denominated in momentum units. An impact spends momentum against it, and reaching zero destroys the Enemy.
+_Avoid_: Health, hit points, HP, armour, durability
+
+**Kill Bound**:
+The world-space rectangle outside which a body is removed from the simulation. Declared per level and never derived from screen size, which varies by device.
+_Avoid_: World bounds, despawn zone, screen edge, boundary
 
 ### Input
 
