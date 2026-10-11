@@ -146,7 +146,7 @@ pub fn run() {
                 // be a silent black screen: on Android there is no stderr to
                 // read, so the message has to reach the display.
                 macroquad::logging::error!("{e}");
-                fatal_screen(&format!("{e}")).await;
+                fatal_screen(&e).await;
                 return;
             }
         };
