@@ -50,7 +50,12 @@ pub enum Anchor {
     /// Terrain. Infinite mass, so only the hero is pulled.
     Fixed(Vec2),
     /// An Enemy or other movable body. Always attaches at its exact centre of mass.
-    Movable(u32),
+    ///
+    /// Carries an [`EntityId`] rather than a bare `u32`. The two were already the
+    /// same number, and leaving them as different types invited passing a slice
+    /// index where an identity was meant, which is exactly the mistake the frame
+    /// contract's id matching exists to prevent.
+    Movable(EntityId),
 }
 
 /// A Gesture's effect, as the Shell reports it. The Shell produces intents; it
@@ -66,6 +71,7 @@ pub enum GestureIntent {
 /// Stable identity for anything the Shell has to draw, so adding a body to the
 /// Core Sim cannot silently fail to render. The interpolation contract is #7.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EntityId(pub u32);
 
 /// Returns the one-way damped spring force pulling `pos` toward `anchor`.
