@@ -8,7 +8,7 @@
 
 use crate::combat;
 use crate::frame::{Body, BodyKind, Snapshot, TongueLine};
-use crate::input::{self, GestureTracker, TouchPhase, TouchSample};
+use crate::input::{self, Claim, GestureTracker, TouchPhase, TouchSample};
 use crate::level::{Aabb, Level};
 use crate::tongue::{self, Pulls, Tongue, Tongues};
 use crate::{
@@ -276,10 +276,13 @@ impl World {
                 break;
             };
             let vacant = core::array::from_fn(|slot| self.tongues[slot].is_none());
-            let Some(slot) = self.gestures.claim(touch.id, vacant) else {
+            let Some(claim) = self.gestures.claim(touch.id, vacant) else {
                 break;
             };
-            self.fire(slot, touch.pos);
+            match claim {
+                Claim::Fire(slot) => self.fire(slot, touch.pos),
+                Claim::Release(slot) => self.release(slot),
+            }
         }
     }
 
@@ -320,6 +323,20 @@ impl World {
                 anchor: Anchor::Fixed(point),
             });
         }
+    }
+
+    /// Releases the Tongue in `slot`, if it holds one.
+    ///
+    /// The whole of retraction. Clearing the slot is all it takes, and that is
+    /// the mechanic rather than a shortcut: the Tongue's only effect on the
+    /// hero is the spring force in [`World::pulls_on`], so the tick after this
+    /// the hero carries exactly the momentum it had under gravity alone, which
+    /// is ADR-0012's instant retraction and the ballistic arc in one.
+    ///
+    /// Nothing is spent and nothing can fail. There is no in-flight state to
+    /// abort, no cooldown, and no cost, so there is no whiff case: ADR-0012.
+    fn release(&mut self, slot: u8) {
+        self.tongues[slot as usize] = None;
     }
 
     /// Every Tongue pulling on one body this Sim Tick, with its Anchor resolved
@@ -371,7 +388,7 @@ impl World {
                 slot: slot as u8,
                 from: from?,
                 to: self.anchor_point(tongue.anchor)?,
-                anchor_id: tongue::anchor_id(tongue.anchor),
+                anchor: tongue.anchor,
             })
         })
     }
@@ -800,6 +817,17 @@ mod tests {
         tap(world, id, from + direction);
     }
 
+    /// Lifts a finger. The end of a Gesture and not a Release: ADR-0006 makes
+    /// attachment outlast the finger, so this frees the slot's *ownership* and
+    /// leaves its Tongue Attached.
+    fn lift(world: &mut World, id: u64) {
+        world.apply_touches(&[TouchSample {
+            id,
+            phase: TouchPhase::Ended,
+            pos: Vec2::ZERO,
+        }]);
+    }
+
     /// Fires a Tongue and returns where it Attached, failing if it did not.
     fn attach(world: &mut World, direction: Vec2) -> Vec2 {
         tap_toward(world, 1, direction);
@@ -1184,8 +1212,9 @@ mod tests {
             "the Tongue is drawn from where the hero is now"
         );
         assert_eq!(
-            line.anchor_id, None,
-            "terrain is a Fixed Anchor and has no body"
+            line.anchor,
+            Anchor::Fixed(anchor),
+            "terrain is a Fixed Anchor, carried by position because it has no body"
         );
     }
 
@@ -1436,6 +1465,82 @@ mod tests {
             assert_eq!(
                 view.tongues[0].to, anchor,
                 "at alpha {alpha} the Tongue was drawn short of its Anchor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_tap_releases_the_attached_tongue() {
+        // ADR-0006, and the traversal loop the ticket names: tap, Swing, tap,
+        // fly. The second tap lands on the slot the first one filled, and a tap
+        // on an occupied slot is a Release.
+        let mut world = World::from_level(&room());
+        attach(&mut world, Vec2::new(0.0, 5.0));
+        lift(&mut world, 1);
+
+        tap_toward(&mut world, 2, Vec2::new(0.0, 5.0));
+        world.step();
+        assert!(
+            world.snapshot().tongues.is_empty(),
+            "the second tap must Release, leaving nothing to draw: {:?}",
+            world.snapshot().tongues
+        );
+    }
+
+    #[test]
+    fn re_targeting_a_slot_to_a_different_terrain_anchor_snaps_rather_than_sweeping() {
+        // ADR-0009: "a re-fired one snaps, otherwise it sweeps across the
+        // level". Until this ticket that case was unreachable, because a slot
+        // held one Tongue for the whole run, and the frame contract therefore
+        // got away with identifying a Fixed Anchor as `None`: two different
+        // terrain points compared equal and the blend predicate could not tell
+        // them apart. Release makes it reachable, which is why the Anchor had
+        // to become part of the contract rather than only the body's id.
+        //
+        // The specific timing matters and is the reason an empty snapshot does
+        // not save us. The Shell draws more frames than there are Sim Ticks, so
+        // it calls `apply_touches` more than once between one tick and the
+        // next: the frame that Releases and the frame that re-fires can both
+        // fall inside a single tick, and then no `Snapshot` ever shows the slot
+        // empty. The slot goes straight from one Anchor to another.
+        let mut world = World::from_level(&room());
+        let ceiling = attach(&mut world, Vec2::new(0.0, 5.0));
+        lift(&mut world, 1);
+
+        // Both of these land between the same pair of Sim Ticks.
+        tap_toward(&mut world, 2, Vec2::new(0.0, 5.0));
+        lift(&mut world, 2);
+        tap_toward(&mut world, 3, Vec2::NEG_Y);
+        world.step();
+
+        let floor = world.snapshot().tongues[0].to;
+        assert_eq!(
+            world.snapshot().tongues.len(),
+            1,
+            "the slot must hold exactly the re-fired Tongue"
+        );
+        assert_ne!(
+            floor, ceiling,
+            "the fixture must re-target to a different surface, or this proves nothing"
+        );
+        assert_eq!(
+            world.previous_snapshot().tongues.len(),
+            1,
+            "the previous tick must still show the old Anchor in that slot, \
+             or the empty snapshot would be doing the snapping"
+        );
+
+        let mut view = Snapshot::default();
+        for alpha in [0.0f32, 0.25, 0.5, 1.0] {
+            crate::frame::interpolate_into(
+                world.previous_snapshot(),
+                world.snapshot(),
+                alpha,
+                &mut view,
+            );
+            assert_eq!(
+                view.tongues[0].to, floor,
+                "at alpha {alpha} the Tongue swept from {ceiling:?} toward {floor:?}"
             );
         }
     }

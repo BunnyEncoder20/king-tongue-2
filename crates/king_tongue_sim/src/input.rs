@@ -53,6 +53,22 @@ pub struct TouchSample {
     pub pos: Vec2,
 }
 
+/// What a Gesture does to the slot it claimed.
+///
+/// One tap does one of these and never both, and which one is decided here
+/// rather than in the `World`: it is the last rule ADR-0006 describes that is
+/// not pure physics, so it belongs behind the seam with the rest of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// The slot was empty, so the Gesture fires a Tongue into it along the
+    /// tapped vector.
+    Fire(u8),
+    /// The slot already held a Tongue, so the Gesture Releases it. The tapped
+    /// vector is ignored: a Release is not aimed at anything, which is why it
+    /// cannot miss and costs nothing. ADR-0012.
+    Release(u8),
+}
+
 /// Which touch currently owns which Tongue slot.
 ///
 /// A slot is owned for as long as the finger is down, and the Tongue it fired
@@ -71,28 +87,43 @@ impl GestureTracker {
         Self::default()
     }
 
-    /// Hands `id` a slot, or `None` if there is nothing to give it.
+    /// Hands `id` the lowest slot no other finger is driving, and says whether
+    /// taking it fires a Tongue or Releases the one already there.
     ///
-    /// `vacant` says which slots hold no Tongue. A slot is grantable only when
-    /// it is both unowned and vacant:
+    /// Two separate questions, and keeping them separate is what makes the
+    /// whole of ADR-0006 fall out of one rule:
     ///
-    /// - unowned, because two fingers down at once must drive two different
-    ///   slots, and a third concurrent finger has nowhere to go and is
-    ///   discarded per ADR-0006 rather than doing something surprising.
-    /// - vacant, because a tap aimed at a slot that already holds a Tongue is a
-    ///   Release, which arrives with ticket #13. Until it does, that tap is
-    ///   inert and the hero Swings indefinitely, which is the interim state
-    ///   ticket #12 expects.
+    /// - **Which** slot is decided by ownership alone. A third concurrent
+    ///   finger finds both slots owned, gets nothing, and is discarded rather
+    ///   than doing something surprising.
+    /// - **What** taking it does is decided by `vacant`, which says which slots
+    ///   hold no Tongue. An empty slot is a [`Claim::Fire`]; an occupied one is
+    ///   a [`Claim::Release`].
+    ///
+    /// So one finger tapping repeatedly always returns to slot 0 and alternates
+    /// fire, Release, fire, which is the traversal loop: tap, Swing, tap, fly.
+    /// Two fingers down *at once* drive slots 0 and 1 and so hold two Tongues
+    /// independently, which is the other half of ADR-0006. Scanning for a
+    /// vacant slot first would instead spend the second tap on a second Tongue
+    /// and leave the player no way to let go.
     ///
     /// Idempotent for an id that already owns a slot, so the `Stationary` a
-    /// held finger reports every frame cannot re-fire it.
-    pub fn claim(&mut self, id: u64, vacant: [bool; MAX_TONGUES]) -> Option<u8> {
+    /// held finger reports every frame can neither re-fire nor Release it.
+    pub fn claim(&mut self, id: u64, vacant: [bool; MAX_TONGUES]) -> Option<Claim> {
         if self.owner_slot(id).is_some() {
             return None;
         }
-        let slot = (0..MAX_TONGUES).find(|&s| self.owners[s].is_none() && vacant[s])?;
+        let slot = (0..MAX_TONGUES).find(|&s| self.owners[s].is_none())?;
         self.owners[slot] = Some(id);
-        Some(slot as u8)
+        // A Release claims the slot exactly as a fire does. The finger now
+        // holds a slot that has gone empty under it, so holding it down cannot
+        // immediately re-fire, and a second finger landing meanwhile still
+        // finds the other slot.
+        Some(if vacant[slot] {
+            Claim::Fire(slot as u8)
+        } else {
+            Claim::Release(slot as u8)
+        })
     }
 
     /// Gives up `id`'s slot, if it held one. The Tongue in that slot stays
@@ -150,8 +181,8 @@ mod tests {
     #[test]
     fn a_third_concurrent_finger_gets_no_slot() {
         let mut tracker = GestureTracker::new();
-        assert_eq!(tracker.claim(10, BOTH_VACANT), Some(0));
-        assert_eq!(tracker.claim(20, BOTH_VACANT), Some(1));
+        assert_eq!(tracker.claim(10, BOTH_VACANT), Some(Claim::Fire(0)));
+        assert_eq!(tracker.claim(20, BOTH_VACANT), Some(Claim::Fire(1)));
         assert_eq!(
             tracker.claim(30, BOTH_VACANT),
             None,
@@ -165,17 +196,44 @@ mod tests {
         // offer it again. Granting a second slot to one finger would let one tap
         // fire both Tongues.
         let mut tracker = GestureTracker::new();
-        assert_eq!(tracker.claim(7, BOTH_VACANT), Some(0));
+        assert_eq!(tracker.claim(7, BOTH_VACANT), Some(Claim::Fire(0)));
         assert_eq!(tracker.claim(7, BOTH_VACANT), None);
     }
 
     #[test]
-    fn an_occupied_slot_is_not_granted() {
-        // Slot 0 already holds a Tongue, so the next finger must be given the
-        // free slot rather than stealing the Attached one.
+    fn a_tap_on_an_occupied_slot_releases_it() {
+        // This test used to be `an_occupied_slot_is_not_granted`, asserting the
+        // interim behaviour ticket #12 recorded as deliberately unfinished:
+        // with no way to Release, a tap on an occupied slot had to be inert or
+        // steal the slot, and it was given the free one instead.
+        //
+        // Under ADR-0006 that tap is the Release, so the slot *is* granted and
+        // what the Gesture does with it changes. Keeping the old expectation
+        // would have spent the player's second tap on a second Tongue and left
+        // the traversal loop with no way to let go.
         let mut tracker = GestureTracker::new();
-        assert_eq!(tracker.claim(1, [false, true]), Some(1));
-        assert_eq!(tracker.claim(2, [false, true]), None);
+        assert_eq!(tracker.claim(1, [false, true]), Some(Claim::Release(0)));
+        assert_eq!(
+            tracker.claim(2, [true, true]),
+            Some(Claim::Fire(1)),
+            "the Releasing finger still holds slot 0, so the next finger fires into slot 1"
+        );
+    }
+
+    #[test]
+    fn which_slot_a_tap_takes_does_not_depend_on_what_is_attached() {
+        // Ownership alone picks the slot, and that separation is what makes one
+        // finger alternate fire and Release on slot 0 rather than wandering up
+        // the slots. A rule that preferred a vacant slot would send the second
+        // tap to slot 1 and never Release anything.
+        for vacant in [[true, true], [false, true], [true, false], [false, false]] {
+            let mut tracker = GestureTracker::new();
+            let claim = tracker.claim(1, vacant).expect("slot 0 is unowned");
+            assert!(
+                matches!(claim, Claim::Fire(0) | Claim::Release(0)),
+                "with vacancy {vacant:?} the first tap took {claim:?} instead of slot 0"
+            );
+        }
     }
 
     #[test]
@@ -216,10 +274,11 @@ mod tests {
     #[test]
     fn a_lifted_finger_frees_its_slot_for_the_next_tap() {
         let mut tracker = GestureTracker::new();
-        assert_eq!(tracker.claim(1, BOTH_VACANT), Some(0));
+        assert_eq!(tracker.claim(1, BOTH_VACANT), Some(Claim::Fire(0)));
         tracker.release_owner(1);
-        // The slot is unowned again, though in the `World` it is no longer
-        // vacant: the Tongue it fired is still Attached.
-        assert_eq!(tracker.claim(2, BOTH_VACANT), Some(0));
+        // The slot is unowned again, and in the `World` it is no longer vacant:
+        // the Tongue the first finger fired is still Attached. So the next tap
+        // comes back to the same slot and Releases it, which is the loop.
+        assert_eq!(tracker.claim(2, [false, true]), Some(Claim::Release(0)));
     }
 }

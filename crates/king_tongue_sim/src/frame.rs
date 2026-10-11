@@ -6,7 +6,7 @@
 //! lives in the Core Sim rather than the Shell because it is deterministic logic
 //! with no platform content, so it is testable headless.
 
-use crate::{EntityId, DT};
+use crate::{Anchor, EntityId, DT};
 use glam::Vec2;
 
 /// The maximum number of Sim Ticks one frame may run.
@@ -108,10 +108,25 @@ pub struct TongueLine {
     pub slot: u8,
     pub from: Vec2,
     pub to: Vec2,
-    /// Identifies what the far end is attached to. Interpolation is only valid
-    /// while this is unchanged: if it differs between snapshots the Tongue was
-    /// re-fired, and blending would draw it sweeping across the level.
-    pub anchor_id: Option<EntityId>,
+    /// What the far end is Attached to. Interpolation is only valid while this
+    /// is unchanged: if it differs between snapshots the Tongue was re-fired,
+    /// and blending would draw it sweeping across the level.
+    ///
+    /// The whole [`Anchor`] and not just the body's id, which is a correction
+    /// rather than a convenience. An `Option<EntityId>` was `None` for *every*
+    /// Fixed Anchor, so two different terrain points compared equal and a slot
+    /// re-targeted from one surface to another blended between them. That was
+    /// unreachable while a slot held one Tongue for a whole run, and Release
+    /// made it reachable: the moment a second tap Releases and a third re-fires
+    /// at different terrain, the Tongue swept across the level.
+    ///
+    /// [`Anchor`] already distinguishes both cases correctly. `Fixed(a)` equals
+    /// `Fixed(b)` when the points agree, and `Movable(id)` compares by
+    /// identity, so a Tongue on a moving Enemy still interpolates while the
+    /// Enemy's position changes every tick. Comparing `to` instead would be
+    /// wrong for exactly that reason: it moves every tick for a Movable Anchor,
+    /// so it would snap on every single frame.
+    pub anchor: Anchor,
 }
 
 /// Everything the Shell needs to draw one Sim Tick. The Core Sim keeps the two
@@ -197,11 +212,11 @@ pub fn interpolate_into(previous: &Snapshot, current: &Snapshot, alpha: f32, out
 
     for cur in &current.tongues {
         let line = match previous.tongue(cur.slot) {
-            Some(prev) if prev.anchor_id == cur.anchor_id => TongueLine {
+            Some(prev) if prev.anchor == cur.anchor => TongueLine {
                 slot: cur.slot,
                 from: prev.from.lerp(cur.from, t),
                 to: prev.to.lerp(cur.to, t),
-                anchor_id: cur.anchor_id,
+                anchor: cur.anchor,
             },
             _ => *cur,
         };
@@ -367,7 +382,7 @@ mod tests {
                 slot: 0,
                 from: Vec2::new(0.0, 0.0),
                 to: Vec2::new(30.0, 30.0),
-                anchor_id: None,
+                anchor: Anchor::Fixed(Vec2::new(30.0, 30.0)),
             }],
         };
         let mut out = Snapshot::default();
@@ -388,7 +403,7 @@ mod tests {
                 slot: 0,
                 from: Vec2::ZERO,
                 to: Vec2::new(-500.0, 0.0),
-                anchor_id: Some(EntityId(1)),
+                anchor: Anchor::Movable(EntityId(1)),
             }],
         };
         let cur = Snapshot {
@@ -398,7 +413,7 @@ mod tests {
                 slot: 0,
                 from: Vec2::ZERO,
                 to: Vec2::new(500.0, 0.0),
-                anchor_id: Some(EntityId(2)),
+                anchor: Anchor::Movable(EntityId(2)),
             }],
         };
         let mut out = Snapshot::default();
@@ -407,6 +422,80 @@ mod tests {
             out.tongues[0].to,
             Vec2::new(500.0, 0.0),
             "anchor changed, must snap"
+        );
+    }
+
+    #[test]
+    fn retargeting_between_two_terrain_anchors_snaps() {
+        // The case an `Option<EntityId>` could not express at all: both of
+        // these are terrain, so both carried `None` and compared equal, and the
+        // Tongue blended a thousand units across the level. Unreachable while a
+        // slot held one Tongue forever; reachable the moment a tap can Release
+        // one and another can re-fire into the same slot.
+        let prev = Snapshot {
+            tick: 1,
+            bodies: vec![],
+            tongues: vec![TongueLine {
+                slot: 0,
+                from: Vec2::ZERO,
+                to: Vec2::new(-500.0, 0.0),
+                anchor: Anchor::Fixed(Vec2::new(-500.0, 0.0)),
+            }],
+        };
+        let cur = Snapshot {
+            tick: 2,
+            bodies: vec![],
+            tongues: vec![TongueLine {
+                slot: 0,
+                from: Vec2::ZERO,
+                to: Vec2::new(500.0, 0.0),
+                anchor: Anchor::Fixed(Vec2::new(500.0, 0.0)),
+            }],
+        };
+        let mut out = Snapshot::default();
+        interpolate_into(&prev, &cur, 0.5, &mut out);
+        assert_eq!(
+            out.tongues[0].to,
+            Vec2::new(500.0, 0.0),
+            "two different terrain Anchors must not compare equal"
+        );
+    }
+
+    #[test]
+    fn a_tongue_on_a_moving_anchor_keeps_interpolating_as_that_anchor_moves() {
+        // The other half of the predicate, and the reason the field is an
+        // `Anchor` rather than a comparison of `to`. A Tongue Attached to a
+        // moving Enemy has a far end that moves every single tick, so
+        // comparing endpoints would snap on every frame and the Tongue would
+        // judder for the whole time it was Attached. Identity is what is
+        // unchanged here, and identity is what must be compared.
+        let enemy = Anchor::Movable(EntityId(3));
+        let prev = Snapshot {
+            tick: 1,
+            bodies: vec![],
+            tongues: vec![TongueLine {
+                slot: 0,
+                from: Vec2::ZERO,
+                to: Vec2::new(0.0, 0.0),
+                anchor: enemy,
+            }],
+        };
+        let cur = Snapshot {
+            tick: 2,
+            bodies: vec![],
+            tongues: vec![TongueLine {
+                slot: 0,
+                from: Vec2::ZERO,
+                to: Vec2::new(10.0, 0.0),
+                anchor: enemy,
+            }],
+        };
+        let mut out = Snapshot::default();
+        interpolate_into(&prev, &cur, 0.5, &mut out);
+        assert_eq!(
+            out.tongues[0].to,
+            Vec2::new(5.0, 0.0),
+            "the same Enemy at a new position must blend, not snap"
         );
     }
 

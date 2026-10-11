@@ -7,7 +7,7 @@
 //! feed it and never restates it.
 
 use crate::level::Aabb;
-use crate::{Anchor, EntityId, DEFAULT_DAMPING, DEFAULT_FORCE_CEILING, MAX_TONGUES};
+use crate::{Anchor, DEFAULT_DAMPING, DEFAULT_FORCE_CEILING, MAX_TONGUES};
 use glam::Vec2;
 
 /// One Attached Tongue.
@@ -164,16 +164,12 @@ fn hit(origin: Vec2, dir: Vec2, aabb: Aabb) -> Option<f32> {
     Some(t_enter.max(0.0))
 }
 
-/// The identity a [`crate::frame::TongueLine`] carries for this Anchor.
-///
-/// `None` for terrain, which has no body and never moves. Interpolation uses
-/// this to decide whether two snapshots describe the same attachment.
-pub fn anchor_id(anchor: Anchor) -> Option<EntityId> {
-    match anchor {
-        Anchor::Fixed(_) => None,
-        Anchor::Movable(id) => Some(id),
-    }
-}
+// An `anchor_id` function used to live here, mapping an `Anchor` to an
+// `Option<EntityId>` for the frame contract to compare. It is gone, and
+// deliberately: it threw away exactly the information interpolation needed,
+// collapsing every Fixed Anchor to `None` so that two different terrain points
+// compared equal. A [`crate::frame::TongueLine`] now carries the whole
+// [`Anchor`], which already compares correctly in both cases.
 
 #[cfg(test)]
 mod tests {

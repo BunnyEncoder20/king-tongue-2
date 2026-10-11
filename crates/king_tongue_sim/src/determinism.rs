@@ -48,8 +48,29 @@ fn aim(world: &mut World, id: u64, phase: TouchPhase, offset: Vec2) {
     }]);
 }
 
-/// Fires one Tongue up and to the left, then a second up and to the right,
-/// lifting each finger the frame after it lands.
+/// Applies several touches in one call, each aimed relative to the hero.
+///
+/// One call and not one per finger, because that is how the platform reports a
+/// frame: every live touch arrives together. Two fingers that landed in
+/// separate calls would never exercise the ascending-id ordering that ADR-0006
+/// makes the determinism rule.
+fn aim_all(world: &mut World, touches: &[(u64, TouchPhase, Vec2)]) {
+    let Some(pos) = world.snapshot().body(world.hero_id()).map(|body| body.pos) else {
+        return;
+    };
+    let samples: Vec<TouchSample> = touches
+        .iter()
+        .map(|(id, phase, offset)| TouchSample {
+            id: *id,
+            phase: *phase,
+            pos: pos + *offset,
+        })
+        .collect();
+    world.apply_touches(&samples);
+}
+
+/// Fires one Tongue up and to the left and, while that finger is still down, a
+/// second up and to the right.
 ///
 /// This is the script that makes the harness mean something for the first time.
 /// Until there was an input path, the only thing it could assert was that a
@@ -58,25 +79,74 @@ fn aim(world: &mut World, id: u64, phase: TouchPhase, offset: Vec2) {
 /// claiming keyed on touch ids, and a spring force whose Anchor is chosen from
 /// simulation state.
 ///
-/// The phases are deliberate. `Started` on one frame and `Ended` or
-/// `Cancelled` on the next is exactly how long the platform makes those
-/// visible, and the `Stationary` in between is what a finger that is still down
-/// reports, so a script that re-fired on a hold would show up here as two
-/// Tongues where one was intended.
+/// The first finger is **held down** until after the second has landed, and
+/// that is now load-bearing rather than incidental. Ticket #12 lifted it, which
+/// worked only while a tap on an occupied slot was inert; under ADR-0006's
+/// completed rule that second tap is a Release, so lifting first would end the
+/// run with no Tongues at all. Two Tongues at once means two fingers at once,
+/// which is exactly what ADR-0006 says dual Tongues are.
+///
+/// The phases are otherwise as deliberate as before. `Started` on one frame and
+/// `Ended` or `Cancelled` on the next is exactly how long the platform makes
+/// those visible, and `Stationary` is what a finger that is still down reports
+/// every frame, so a script that re-fired on a hold would show up here as a
+/// Tongue that kept re-Attaching.
 pub fn fires_two_tongues(tick: u64, world: &mut World) {
     const UP_LEFT: Vec2 = Vec2::new(-2.0, 4.0);
     const UP_RIGHT: Vec2 = Vec2::new(3.0, 2.0);
     match tick {
-        20 => aim(world, 1, TouchPhase::Started, UP_LEFT),
-        21 => aim(world, 1, TouchPhase::Stationary, UP_LEFT),
-        22 => aim(world, 1, TouchPhase::Ended, UP_LEFT),
+        20 => aim_all(world, &[(1, TouchPhase::Started, UP_LEFT)]),
         // Well after the first, so the hero is Swinging on one Tongue when the
         // second Gesture arrives and the second Anchor depends on where that
-        // Swing had carried it.
-        90 => aim(world, 2, TouchPhase::Started, UP_RIGHT),
-        // Cancelled rather than Ended, because the platform uses it when the
-        // app loses focus and ADR-0006 forbids reading either as a Release.
-        91 => aim(world, 2, TouchPhase::Cancelled, UP_RIGHT),
+        // Swing had carried it. Both fingers in one call, as a frame reports.
+        90 => aim_all(
+            world,
+            &[
+                (1, TouchPhase::Stationary, UP_LEFT),
+                (2, TouchPhase::Started, UP_RIGHT),
+            ],
+        ),
+        // Cancelled rather than Ended for the second, because the platform uses
+        // it when the app loses focus and ADR-0006 forbids reading either as a
+        // Release. Both Tongues must survive it.
+        91 => aim_all(
+            world,
+            &[
+                (1, TouchPhase::Ended, UP_LEFT),
+                (2, TouchPhase::Cancelled, UP_RIGHT),
+            ],
+        ),
+        21..=89 => aim_all(world, &[(1, TouchPhase::Stationary, UP_LEFT)]),
+        _ => {}
+    }
+}
+
+/// Fires a Tongue, Swings on it, Releases it with a second tap, and fires
+/// again at whatever the ray finds from the new position.
+///
+/// Release is the case most likely to lose determinism in this module, for a
+/// reason none of the other scripts reach: it changes the *number* of Tongues
+/// mid-run in both directions, and the Anchor the third tap finds depends on
+/// the entire ballistic arc the Release threw the hero along. A slot cleared in
+/// the wrong order, or an Anchor re-resolved from a stale position, diverges
+/// here and nowhere else.
+///
+/// Each tap is a separate finger that lifts on the following frame, which is
+/// the discrete tap loop ADR-0006 describes: tap, Swing, tap, fly.
+pub fn releases_mid_swing(tick: u64, world: &mut World) {
+    const UP_LEFT: Vec2 = Vec2::new(-2.0, 4.0);
+    const UP_RIGHT: Vec2 = Vec2::new(3.0, 3.0);
+    match tick {
+        10 => aim_all(world, &[(1, TouchPhase::Started, UP_LEFT)]),
+        11 => aim_all(world, &[(1, TouchPhase::Ended, UP_LEFT)]),
+        // Mid-Swing, so the hero leaves on a tangent carrying real momentum
+        // rather than from a hang at rest.
+        70 => aim_all(world, &[(2, TouchPhase::Started, UP_LEFT)]),
+        71 => aim_all(world, &[(2, TouchPhase::Ended, UP_LEFT)]),
+        // Re-fired from wherever the ballistic arc carried the hero, into a
+        // slot that has been occupied, emptied, and is now filled again.
+        140 => aim_all(world, &[(3, TouchPhase::Started, UP_RIGHT)]),
+        141 => aim_all(world, &[(3, TouchPhase::Cancelled, UP_RIGHT)]),
         _ => {}
     }
 }
@@ -209,7 +279,7 @@ pub fn first_divergence(left: &[Snapshot], right: &[Snapshot]) -> Option<String>
             ));
         }
         for (x, y) in a.tongues.iter().zip(&b.tongues) {
-            if x.slot != y.slot || x.anchor_id != y.anchor_id {
+            if x.slot != y.slot || x.anchor != y.anchor {
                 return Some(format!(
                     "tick {tick}: Tongue slots or Anchors differ, {x:?} against {y:?}"
                 ));
@@ -343,6 +413,49 @@ mod tests {
             last.tongues.iter().all(|t| t.to.is_finite()),
             "an Anchor went non-finite: {:?}",
             last.tongues
+        );
+    }
+
+    #[test]
+    fn releasing_produces_identical_snapshot_sequences() {
+        // The AC's determinism clause. Release is the only scripted event that
+        // removes a Tongue, and what follows it is unconstrained ballistic
+        // motion whose landing point feeds the next tap's ray cast, so a
+        // divergence of a single bit at the moment of Release is amplified by
+        // every tick after it rather than damped by the spring.
+        assert_deterministic(&enclosed_scene(), 300, releases_mid_swing);
+    }
+
+    #[test]
+    fn the_release_script_really_attaches_releases_and_re_attaches() {
+        // Guards the test above from passing vacuously, the same way the firing
+        // script is guarded. A script whose second tap silently fired a second
+        // Tongue instead of Releasing the first would be perfectly
+        // deterministic and would assert nothing about Release at all, which is
+        // precisely the bug this ticket fixed.
+        let trace = record(&enclosed_scene(), 300, releases_mid_swing);
+        assert_eq!(
+            trace[12].tongues.len(),
+            1,
+            "the first Gesture must have Attached: {:?}",
+            trace[12].tongues
+        );
+        assert!(
+            trace[72].tongues.is_empty(),
+            "the second Gesture must have Released, leaving nothing: {:?}",
+            trace[72].tongues
+        );
+        assert_eq!(
+            trace[142].tongues.len(),
+            1,
+            "the third Gesture must have re-Attached: {:?}",
+            trace[142].tongues
+        );
+        // And the slot is reused rather than the Tongue walking up the slots,
+        // which is what a Release that merely hid the Tongue would look like.
+        assert_eq!(
+            trace[142].tongues[0].slot, 0,
+            "a re-fire must come back to slot 0"
         );
     }
 
