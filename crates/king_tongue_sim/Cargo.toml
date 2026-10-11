@@ -15,7 +15,13 @@ publish = false
 [dependencies]
 glam = { workspace = true }
 serde = { workspace = true, optional = true }
+ron = { workspace = true, optional = true }
 
 [features]
 default = []
-serde = ["dep:serde", "glam/serde"]
+# Level parsing. ADR-0001 permits a parser behind a feature flag; keeping it
+# off by default is what lets scripts/check-sim-deps.sh assert the boundary.
+serde = ["dep:serde", "dep:ron", "glam/serde"]
+# ASCII level sketches for readable headless tests. Never enabled in a build
+# that ships.
+test-util = []

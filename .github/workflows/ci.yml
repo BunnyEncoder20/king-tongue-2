@@ -30,6 +30,14 @@ jobs:
       - name: Core Sim tests with serde
         run: cargo test -p king_tongue_sim --features serde
 
+      - name: Core Sim tests with ASCII test helper
+        run: cargo test -p king_tongue_sim --features test-util
+
+      # A level file that stops parsing is a broken game, and it would
+      # otherwise only surface by launching. ADR-0010.
+      - name: Shipped level assets parse
+        run: cargo run --example parse_check -p king_tongue_sim --features serde
+
       - run: cargo fmt --all --check
       - run: cargo clippy -p king_tongue_sim --all-targets -- -D warnings
 

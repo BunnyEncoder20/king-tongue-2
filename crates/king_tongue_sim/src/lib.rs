@@ -11,8 +11,10 @@
 #![forbid(unsafe_code)]
 
 pub mod frame;
+pub mod level;
 
 pub use frame::{Accumulator, Body, BodyKind, Snapshot, TongueLine, MAX_CATCHUP_TICKS};
+pub use level::{Aabb, EnemySpawn, Level, LevelError};
 
 use glam::Vec2;
 

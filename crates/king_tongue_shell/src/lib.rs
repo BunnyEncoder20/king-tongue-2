@@ -104,6 +104,27 @@ fn draw_frame(view: &Snapshot, origin: macroquad::math::Vec2) {
     }
 }
 
+/// Reads a level through Macroquad's asset loader and parses it in the Core Sim.
+///
+/// The split is the point: the Shell does the I/O, which on Android means APK
+/// assets rather than a filesystem path, and hands the Core Sim raw bytes. The
+/// Core Sim never learns which platform it is on. ADR-0001, ADR-0010.
+pub async fn load_level(path: &str) -> Result<sim::Level, String> {
+    let bytes = macroquad::file::load_file(path)
+        .await
+        .map_err(|e| format!("could not read level {path}: {e}"))?;
+    sim::Level::from_bytes(&bytes).map_err(|e| format!("level {path} is unusable: {e}"))
+}
+
+/// Holds a readable error on screen. Android gives us no terminal to print to.
+async fn fatal_screen(message: &str) {
+    loop {
+        macroquad::window::clear_background(macroquad::color::MAROON);
+        macroquad::text::draw_text(message, 20.0, 40.0, 22.0, macroquad::color::WHITE);
+        macroquad::window::next_frame().await;
+    }
+}
+
 /// The Shell's entry point, shared by the Android cdylib and the desktop bin.
 pub fn run() {
     macroquad::Window::from_config(window_conf(), async move {
@@ -111,6 +132,29 @@ pub fn run() {
         // double-report every Gesture. Research on ticket #2 confirmed this
         // defaults to true, so it must be turned off explicitly.
         macroquad::input::simulate_mouse_with_touch(false);
+
+        // On Android, assets resolve from the root of the APK's assets folder;
+        // on desktop they resolve relative to the working directory. This call
+        // makes one path string work on both, and it must happen before the
+        // first load. See ADR-0010.
+        macroquad::file::set_pc_assets_folder("assets");
+
+        let level = match load_level("levels/test_scene.ron").await {
+            Ok(level) => level,
+            Err(e) => {
+                // A missing or malformed level is unrecoverable, but it must not
+                // be a silent black screen: on Android there is no stderr to
+                // read, so the message has to reach the display.
+                macroquad::logging::error!("{e}");
+                fatal_screen(&format!("{e}")).await;
+                return;
+            }
+        };
+        macroquad::logging::info!(
+            "level loaded: {} terrain, {} enemies",
+            level.static_terrain.len(),
+            level.enemy_spawns.len()
+        );
 
         let mut accumulator = Accumulator::new();
         // The two snapshots ADR-0002 requires, plus a reused interpolation buffer

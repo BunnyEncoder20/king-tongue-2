@@ -1,0 +1,44 @@
+// The Placeholder Geometry acceptance bar: attach, Swing, Release, Slam.
+// One character of art does not belong in this file.
+//
+// Units are world units; one unit is roughly one metre. Gravity is moon-scale
+// (-1.62), so these distances feel larger than Earth intuition suggests.
+Level(
+    // The kill bound. A Thrown Enemy leaving this box despawns. Deliberately
+    // wider than the playfield so a slung Enemy has somewhere to fly.
+    // World-space, never screen-space: screen size varies by device and that
+    // would make despawn non-deterministic (ADR-0002).
+    world_bounds: Aabb(centre: (0.0, 10.0), half_extents: (80.0, 60.0)),
+
+    static_terrain: [
+        // Floor. Anchorable, like every surface: the Anchor validity resolution
+        // ruled out ungrappable terrain, and anchoring downward is how the
+        // player builds descent speed to strike a ground Enemy from above.
+        Aabb(centre: (0.0, -1.0), half_extents: (40.0, 1.0)),
+
+        // Ceiling, for hanging and for the loaded-Stretch slingshot.
+        Aabb(centre: (0.0, 34.0), half_extents: (40.0, 1.0)),
+
+        // Side walls.
+        Aabb(centre: (-40.0, 16.0), half_extents: (1.0, 18.0)),
+        Aabb(centre: ( 40.0, 16.0), half_extents: (1.0, 18.0)),
+
+        // Two floating platforms, so there is something to swing between.
+        Aabb(centre: (-16.0, 14.0), half_extents: (6.0, 0.8)),
+        Aabb(centre: ( 16.0, 20.0), half_extents: (6.0, 0.8)),
+    ],
+
+    player_spawn: (0.0, 6.0),
+
+    enemy_spawns: [
+        // Light: one clean Slam at modest speed should destroy it outright.
+        EnemySpawn(pos: (-24.0, 4.0), toughness:  60.0, mass: 1.0),
+
+        // Mid: survives a weak hit, so it exercises the Thrown state.
+        EnemySpawn(pos: ( 22.0, 10.0), toughness: 150.0, mass: 2.0),
+
+        // Heavy ground unit: the stated scenario for anchoring to the floor and
+        // striking from above, since a level approach will not break it.
+        EnemySpawn(pos: ( 10.0, 1.0), toughness: 400.0, mass: 5.0),
+    ],
+)

@@ -13,6 +13,7 @@ publish = false
 glam = "0.30.10"
 macroquad = "=0.4.16"
 serde = { version = "1.0.228", default-features = false, features = ["derive", "alloc"] }
+ron = "0.12.2"
 
 [profile.release]
 opt-level = 3
