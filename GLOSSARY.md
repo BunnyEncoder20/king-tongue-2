@@ -90,6 +90,10 @@ _Avoid_: Frontend, view, platform layer, renderer
 One fixed-duration step of the Core Sim, advanced independently of render frames.
 _Avoid_: Frame, update, step
 
+**Camera**:
+The Shell's view onto the world, always zoomed in and always following the hero. It is view state, never game state, and the Core Sim has no knowledge of it. The whole level is never visible at once.
+_Avoid_: Viewport, view, lens, screen
+
 **Placeholder Geometry**:
 Untextured primitives standing in for art, sufficient to demonstrate a mechanic and deliberately not a visual target.
 _Avoid_: Stub art, programmer art, mockup
