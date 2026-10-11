@@ -6,6 +6,7 @@
 //! fixed Sim Tick, ADR-0007 for the integrator, and ADR-0009 for the two
 //! snapshots this type retains.
 
+use crate::combat;
 use crate::frame::{Body, BodyKind, Snapshot, TongueLine};
 use crate::input::{self, GestureTracker, TouchPhase, TouchSample};
 use crate::level::{Aabb, Level};
@@ -53,6 +54,17 @@ struct BodyState {
     vel: Vec2,
     facing: Vec2,
     mass: f32,
+    /// Resistance to being destroyed, in momentum units. GLOSSARY: an impact
+    /// spends momentum against it and reaching zero destroys the body, which is
+    /// why there is no separate destroyed flag.
+    ///
+    /// The hero's is infinite. The hero's one-shot fail state is deferred in the
+    /// map's fog, so nothing may destroy the hero yet, and an infinite pool says
+    /// that in the same terms everything else uses.
+    toughness: f32,
+    /// Whether the hero was in contact at the end of the previous Sim Tick, so
+    /// that one pass costs one impact. See `combat::EnemyTarget::touching`.
+    touching_hero: bool,
 }
 
 /// All simulation state, and the only way to advance it.
@@ -112,6 +124,8 @@ impl World {
             // than an angle per ADR-0009, so it must never be zero.
             facing: Vec2::X,
             mass: DEFAULT_PLAYER_MASS,
+            toughness: f32::INFINITY,
+            touching_hero: false,
         });
 
         for spawn in &level.enemy_spawns {
@@ -123,6 +137,8 @@ impl World {
                 vel: Vec2::ZERO,
                 facing: Vec2::X,
                 mass: spawn.mass,
+                toughness: spawn.toughness,
+                touching_hero: false,
             });
         }
 
@@ -167,6 +183,15 @@ impl World {
     /// the arrangement ADR-0007's stability and drift numbers were measured in.
     /// Changing it invalidates those measurements.
     pub fn step(&mut self) {
+        // Where the hero began the tick, kept for the combat sweep below: an
+        // impact is a question about the path the hero travelled and not about
+        // where it ended up.
+        let hero_start = self
+            .bodies
+            .iter()
+            .find(|b| b.id == self.hero)
+            .map(|b| b.pos);
+
         for i in 0..self.bodies.len() {
             let body = self.bodies[i];
 
@@ -198,6 +223,13 @@ impl World {
 
             self.bodies[i].pos = pos;
             self.bodies[i].vel = vel;
+        }
+
+        // Impacts are impulses and not forces, so they are resolved here, once,
+        // after the integration step. Putting any of this inside `body_force`
+        // would have ADR-0007's integrator apply it twice per Sim Tick.
+        if let Some(start) = hero_start {
+            self.resolve_impacts(start);
         }
 
         self.tick += 1;
@@ -344,37 +376,86 @@ impl World {
         })
     }
 
-    /// Sets a body's velocity outright, for headless tests.
-    ///
-    /// Gated behind `test-util` exactly like `Level::from_ascii`, so it cannot
-    /// reach a build that ships. It exists because some claims are about motion
-    /// the hero has to already be carrying: an orbit needs tangential velocity,
-    /// and the one-way spring's refusal to push has to be checked while racing
-    /// inward. Earning that velocity by Swinging first would make those tests
-    /// depend on the very force they are measuring.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn set_body_velocity(&mut self, id: EntityId, vel: Vec2) {
-        if let Some(body) = self.bodies.iter_mut().find(|b| b.id == id) {
-            body.vel = vel;
-        }
-    }
-
     /// Reads a body's velocity, for headless tests.
     ///
-    /// Gated for the same reason as [`World::set_body_velocity`]. Velocity is
-    /// absent from the [`Snapshot`] because the Shell has no use for it, but an
-    /// energy budget cannot be computed without it, and deriving it from two
-    /// snapshot positions would fold the integrator's own discretisation into
-    /// the number being checked.
+    /// Gated for the same reason as [`World::place`], which is the companion
+    /// that writes it. Velocity is absent from the [`Snapshot`] because the
+    /// Shell has no use for it, but an energy budget cannot be computed without
+    /// it, and deriving it from two snapshot positions would fold the
+    /// integrator's own discretisation into the number being checked.
     #[cfg(any(test, feature = "test-util"))]
     pub fn body_velocity(&self, id: EntityId) -> Option<Vec2> {
         self.body(id).map(|b| b.vel)
+    }
+
+    /// Resolves the hero's pass over this Sim Tick against every Enemy, and
+    /// removes whatever it destroyed.
+    ///
+    /// Thin by design: every rule lives in [`crate::combat`] as a pure function,
+    /// and this is the one place in the tick allowed to write the result back.
+    /// Enemies are visited in body order, which is stable for a run, so the
+    /// outcome of a tick that touches two of them is deterministic.
+    fn resolve_impacts(&mut self, hero_start: Vec2) {
+        let Some(h) = self.bodies.iter().position(|b| b.id == self.hero) else {
+            return;
+        };
+
+        for i in 0..self.bodies.len() {
+            if self.bodies[i].kind != BodyKind::Enemy {
+                continue;
+            }
+            // Rebuilt per Enemy from the live hero, so two impacts in one tick
+            // compound rather than the second overwriting the first.
+            let hero = self.bodies[h];
+            let pass = combat::HeroPass {
+                start: hero_start,
+                end: hero.pos,
+                vel: hero.vel,
+                mass: hero.mass,
+                radius: PLAYER_RADIUS,
+            };
+            let enemy = self.bodies[i];
+            let resolved = combat::resolve_contact(
+                &pass,
+                &combat::EnemyTarget {
+                    pos: enemy.pos,
+                    vel: enemy.vel,
+                    mass: enemy.mass,
+                    toughness: enemy.toughness,
+                    touching: enemy.touching_hero,
+                },
+            );
+
+            self.bodies[h].vel = resolved.hero_vel;
+            self.bodies[i].vel = resolved.enemy_vel;
+            self.bodies[i].toughness = resolved.toughness;
+            self.bodies[i].touching_hero = resolved.touching;
+        }
+
+        // An emptied pool is destruction, so there is one rule and not two. The
+        // hero's pool is infinite, which is how the deferred hero fail state
+        // stays unimplemented rather than accidentally arriving here.
+        self.bodies.retain(|b| b.toughness > 0.0);
     }
 
     fn alloc_id(&mut self) -> EntityId {
         let id = EntityId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Places a body at `pos` travelling at `vel`.
+    ///
+    /// Test scaffolding, gated like [`crate::level::Level::from_ascii`] so it
+    /// cannot reach a build that ships. A combat test is about what happens at
+    /// the moment of impact, and assigning the momentum rather than earning it
+    /// by Swinging is what lets those tests exist before a Tongue does.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn place(&mut self, id: EntityId, pos: Vec2, vel: Vec2) {
+        if let Some(body) = self.bodies.iter_mut().find(|b| b.id == id) {
+            body.pos = pos;
+            body.vel = vel;
+        }
     }
 }
 
@@ -1232,7 +1313,7 @@ mod tests {
             DEFAULT_DAMPING * inward > world.hero_pull_strength() * stretch,
             "fixture must race in hard enough for damping to dominate"
         );
-        world.set_body_velocity(world.hero_id(), Vec2::new(0.0, inward));
+        world.place(world.hero_id(), start, Vec2::new(0.0, inward));
 
         world.step();
         let expected = start + Vec2::new(0.0, inward) * DT + 0.5 * GRAVITY * DT * DT;
@@ -1264,7 +1345,7 @@ mod tests {
         let anchor = attach(&mut world, Vec2::Y);
         // Across the pull rather than along it, which is what makes the motion
         // orbital rather than a bounce up and down the Tongue.
-        world.set_body_velocity(hero_id, Vec2::new(2.5, 0.0));
+        world.place(hero_id, hero(&world).pos, Vec2::new(2.5, 0.0));
 
         let energy = |world: &World| {
             let pos = hero(world).pos;
