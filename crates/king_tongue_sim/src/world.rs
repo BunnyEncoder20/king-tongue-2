@@ -19,6 +19,24 @@ use glam::Vec2;
 /// `while` loop would not.
 const MAX_SLIDE_PASSES: usize = 4;
 
+/// How far the swept test pulls a grown box in from its true size, so that
+/// touching a surface exactly is not read as crossing into it.
+///
+/// This exists because of one specific case. A floor is a row of boxes, and a
+/// body resting on it sits exactly tangent to the top of the next box along.
+/// Growing each box by the body's radius makes that tangency look like a hit on
+/// the next box's *side*, reporting a sideways normal, and horizontal motion
+/// then stops dead at every tile boundary. In exact circle geometry the contact
+/// is a corner graze whose normal points straight up and motion along the floor
+/// is untouched, so the sideways hit is an artifact of the square-corner
+/// approximation and not real.
+///
+/// Pulling the box in by a hair makes an exact graze miss, which is the right
+/// answer. Genuine contact is still caught: depenetration works on the true
+/// geometry, so a resting body ends up at exactly its radius from the surface
+/// within a tick of landing.
+const GRAZE_EPSILON: f32 = 1e-4;
+
 /// One simulated body. Private on purpose: the Shell and the tests see bodies
 /// only through a [`Snapshot`], so the internal representation stays free to
 /// grow a Tongue list, a Toughness pool, and a Combo without breaking a test.
@@ -360,7 +378,7 @@ fn first_crossing(
 /// invisible, and the alternative is per-corner circle tests for an accuracy
 /// nothing here can see.
 fn crossing(origin: Vec2, motion: Vec2, aabb: Aabb, radius: f32) -> Option<(f32, Vec2)> {
-    let grown = Vec2::splat(radius);
+    let grown = Vec2::splat(radius - GRAZE_EPSILON);
     let min = aabb.min() - grown;
     let max = aabb.max() + grown;
 
@@ -679,6 +697,40 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), 3, "identities must not be reused: {ids:?}");
         assert!(ids.contains(&world.hero_id()));
+    }
+
+    #[test]
+    fn sliding_along_a_tiled_floor_does_not_catch_on_a_seam() {
+        // Found by reading the sweep rather than by a failure, and it is tested
+        // one level below the `World` seam on purpose: nothing in this ticket
+        // moves the hero sideways, so there is no way to provoke it through
+        // `World` until the Tongue arrives. `sweep` is a pure function of
+        // geometry, so this asserts its contract and not any private state.
+        //
+        // A floor is a row of one-unit boxes, so a body resting on it sits
+        // exactly tangent to the top of the next box along. Growing each box by
+        // the body's radius turns that tangency into an apparent hit on the
+        // next box's left face, with a sideways normal, and horizontal motion
+        // stops dead at every tile boundary. In exact circle geometry the
+        // contact is a corner graze whose normal points straight up, and motion
+        // along the floor is untouched.
+        let floor: Vec<Aabb> = (0..5)
+            .map(|i| Aabb::new(Vec2::new(i as f32 + 0.5, 0.5), Vec2::splat(0.5)))
+            .collect();
+        let start = Vec2::new(0.5, 1.0 + PLAYER_RADIUS);
+        let motion = Vec2::new(0.5, 0.0);
+
+        let (end, _) = sweep(start, start + motion, PLAYER_RADIUS, &floor);
+
+        assert!(
+            (end.x - (start.x + motion.x)).abs() < 1e-5,
+            "caught on a tile seam: expected x {}, got {end:?}",
+            start.x + motion.x
+        );
+        assert!(
+            (end.y - start.y).abs() < 1e-5,
+            "should have stayed on the floor, got {end:?}"
+        );
     }
 
     #[cfg(feature = "serde")]
