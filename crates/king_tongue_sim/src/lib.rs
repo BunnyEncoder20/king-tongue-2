@@ -12,14 +12,20 @@
 
 pub mod frame;
 pub mod level;
+pub mod world;
 
 pub use frame::{Accumulator, Body, BodyKind, Snapshot, TongueLine, MAX_CATCHUP_TICKS};
 pub use level::{Aabb, EnemySpawn, Level, LevelError};
+pub use world::World;
 
 use glam::Vec2;
 
 /// Player hitbox radius. All lengths are world units; treat one unit as one metre.
 pub const PLAYER_RADIUS: f32 = 0.5;
+
+/// The baseline hero's mass. A parameter and not a character system: ADR-0001's
+/// Core Sim carries `mass` per body, and the hero archetype roster is in the fog.
+pub const DEFAULT_PLAYER_MASS: f32 = 1.0;
 
 /// The Tongue's rest boundary, tied to player geometry rather than tuned freely.
 /// Below this the Tongue is slack and applies nothing. ADR-0003.

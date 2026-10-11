@@ -125,7 +125,14 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    fn body(&self, id: EntityId) -> Option<&Body> {
+    /// Finds a body by identity.
+    ///
+    /// Public because the Camera needs the hero's position out of an
+    /// *interpolated* snapshot, and the only honest way for the Shell to ask
+    /// that question is by the id the Core Sim hands it. Searching for
+    /// `BodyKind::Hero` in the Shell instead would put a game-logic branch
+    /// where ADR-0001 forbids one.
+    pub fn body(&self, id: EntityId) -> Option<&Body> {
         self.bodies.iter().find(|b| b.id == id)
     }
 
