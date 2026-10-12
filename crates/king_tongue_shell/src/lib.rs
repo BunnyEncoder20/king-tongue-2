@@ -92,20 +92,47 @@ pub fn window_conf() -> macroquad::window::Conf {
     }
 }
 
-/// Draws one interpolated body.
+/// Draws one interpolated body, in the shape that actually collides.
 ///
 /// The match is deliberately exhaustive with no catch-all arm. That is the whole
-/// enforcement mechanism for "adding an entity cannot silently fail to render".
+/// enforcement mechanism for "adding an entity cannot silently fail to render",
+/// and it is why the shape is decided inside the same match as the tint rather
+/// than beside it: a new `BodyKind` has to answer both questions or fail to
+/// build.
+///
+/// **Per kind, because the collision shapes differ.** The hero is a bounding
+/// circle of `PLAYER_RADIUS`; an Enemy is a bounding box of
+/// `ENEMY_HALF_EXTENTS`. Drawing every body as a circle put hits up to about
+/// 0.21 units outside the drawn shape at an Enemy's corners, which is exactly
+/// what Placeholder Geometry exists not to do: the sketch has to mean what it
+/// looks like, or tuning is done against a lie.
+///
+/// A Thrown Enemy is drawn as the same box. It sweeps as its box's inscribed
+/// circle when it is the projectile, which is the approximation the integrator
+/// has made for every body since ticket #11, but it is still a box when it is
+/// the thing being struck, and the box is the outer of the two.
 fn draw_body(body: &sim::Body, origin: macroquad::math::Vec2) {
     use macroquad::color;
     let p = to_screen(body.pos, origin);
-    let r = sim::PLAYER_RADIUS * PIXELS_PER_UNIT;
-    let tint = match body.kind {
-        BodyKind::Hero => color::SKYBLUE,
-        BodyKind::Enemy => color::GRAY,
-        BodyKind::Thrown => color::ORANGE,
+    let (tint, half_extents) = match body.kind {
+        BodyKind::Hero => (color::SKYBLUE, None),
+        BodyKind::Enemy => (color::GRAY, Some(sim::combat::ENEMY_HALF_EXTENTS)),
+        BodyKind::Thrown => (color::ORANGE, Some(sim::combat::ENEMY_HALF_EXTENTS)),
     };
-    macroquad::shapes::draw_circle(p.x, p.y, r, tint);
+    match half_extents {
+        None => {
+            let r = sim::PLAYER_RADIUS * PIXELS_PER_UNIT;
+            macroquad::shapes::draw_circle(p.x, p.y, r, tint);
+        }
+        Some(half) => {
+            // Screen y grows downward, so a box's upper left on screen is its
+            // minimum x and its maximum y in the world. Same conversion as
+            // `draw_terrain`, which draws the other boxes in the scene.
+            let corner = to_screen(body.pos + glam::Vec2::new(-half.x, half.y), origin);
+            let size = half * 2.0 * PIXELS_PER_UNIT;
+            macroquad::shapes::draw_rectangle(corner.x, corner.y, size.x, size.y, tint);
+        }
+    }
     // Facing, drawn from the unit vector the contract carries rather than from an
     // angle, so it is never reconstructed through atan2 and re-wrapped.
     let tip = to_screen(body.pos + body.facing * sim::PLAYER_RADIUS * 1.8, origin);

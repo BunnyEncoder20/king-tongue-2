@@ -19,9 +19,16 @@ use glam::Vec2;
 /// Half the extent of an Enemy's collision box.
 ///
 /// ADR-0011 fixes the shape of the test (circle against box) but not the size.
-/// One unit square matches the cell an ASCII sketch spawns an Enemy into and the
-/// Placeholder Geometry the Shell draws for one, so a sketched scene means what
-/// it looks like.
+/// One unit square matches the cell an ASCII sketch spawns an Enemy into, so a
+/// sketched scene means what it looks like.
+///
+/// It also has to be what the Shell draws, and for a while it was not: the
+/// Shell drew every body as a circle of `PLAYER_RADIUS` while this comment
+/// claimed it drew a unit square, so hits landed up to about 0.21 units outside
+/// the drawn shape at the corners and the comment asserted the opposite of the
+/// code. `draw_body` now draws this box for an Enemy and for a Thrown Enemy.
+/// Placeholder Geometry is only worth tuning against while the drawn shape is
+/// the shape that collides.
 pub const ENEMY_HALF_EXTENTS: Vec2 = Vec2::splat(0.5);
 
 /// Below this much normal momentum an impact is a Kick rather than a Slam.
