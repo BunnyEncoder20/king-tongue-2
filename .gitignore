@@ -6,3 +6,9 @@
 # checked-in project config belongs beside it and ignoring the parent would
 # silently swallow it.
 /.claude/worktrees/
+# Per-developer permission state, which is personal and never shared. Narrowing
+# the rule above exposed this file, and it stayed invisible here only because
+# one machine happened to carry `**/.claude/settings.local.json` in a global
+# ignore. A machine-local config is not a guard the repository can rely on.
+# `settings.json`, the shared project config, is deliberately still trackable.
+/.claude/settings.local.json
