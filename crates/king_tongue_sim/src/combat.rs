@@ -150,12 +150,16 @@ pub fn resolve_contact(hero: &HeroPass, enemy: &EnemyTarget) -> Resolution {
         return Resolution::inert(hero, enemy, false);
     };
 
-    // Closing speed along the normal. ADR-0011 writes the gate as `|m * v . n|`
-    // with `v` the hero's velocity; taking it relative to the Enemy is the same
-    // number whenever the Enemy is at rest, and the honest one once an earlier
-    // impact has set it moving. The sign is kept rather than taken as an
-    // absolute value so that bodies already separating do not register: a hero
-    // leaving an Enemy it has just Kicked is not hitting it again.
+    // Closing speed along the normal, relative and signed. ADR-0011 used to
+    // write the gate as `|m * v . n|` with `v` the hero's velocity, and its
+    // "The gate is signed relative closing" section now records this form
+    // instead: taking it relative to the Enemy is the same number whenever the
+    // Enemy is at rest, and the honest one once an earlier impact has set it
+    // moving. The sign is kept rather than taken as an absolute value so that
+    // bodies already separating do not register: a hero leaving an Enemy it has
+    // just Kicked is not hitting it again. That section also holds the measured
+    // consequence, which is that a fleeing Enemy can land more than one band
+    // below what the absolute form would have scored.
     let closing = (enemy.vel - hero.vel).dot(contact.normal);
     if closing <= 0.0 {
         return Resolution::inert(hero, enemy, true);
@@ -642,6 +646,57 @@ mod tests {
         let out = resolve_contact(&hero, &enemy(100.0));
         assert_eq!(out.band, None, "{out:?}");
         assert_eq!(out.toughness, 100.0);
+    }
+
+    #[test]
+    fn an_enemy_already_moving_away_reads_a_lower_band_than_the_absolute_gate_would() {
+        // ADR-0011 writes the gate as `|m * v . n|` with `v` the hero's
+        // velocity; this module reads the **relative** closing instead, and the
+        // ADR records why that supersedes the absolute form. What the ADR
+        // cannot argue in prose is how far the two diverge, so it is asserted
+        // here: the band an impact lands in depends on how fast the target is
+        // already leaving, and it is not capped at one band of difference.
+        //
+        // One geometry throughout, so nothing below differs for any reason but
+        // the Enemy's own velocity. The normal is `NEG_X` for a head-on pass,
+        // and at the hero's mass of 1 the absolute gate would read 10 against
+        // every row: above this Enemy's Toughness of 4, so the ADR's band
+        // table calls all four of these Destroy.
+        const TOUGHNESS: f32 = 4.0;
+        let hero = pass(
+            Vec2::new(-2.0, 0.0),
+            Vec2::new(-0.5, 0.0),
+            Vec2::new(10.0, 0.0),
+        );
+        assert_eq!(hero.mass, 1.0, "the arithmetic below assumes a unit mass");
+        assert!(
+            hero.vel.x >= TOUGHNESS,
+            "the absolute gate must read Destroy for every row, or nothing diverges"
+        );
+
+        // Expected bands worked out from the relative closing by hand, not from
+        // the code: closing is `hero.vel.x - fleeing`, and the thresholds are
+        // KICK_THRESHOLD (2) and TOUGHNESS (4).
+        let rows = [
+            (0.0f32, Some(ImpactBand::Destroy)), // closing 10: the ADR agrees
+            (7.0, Some(ImpactBand::Slam)),       // closing 3: one band lower
+            (8.5, Some(ImpactBand::Kick)),       // closing 1.5: two bands lower
+            (11.0, None),                        // closing -1: no impact at all
+        ];
+        for (fleeing, expected) in rows {
+            let mut target = enemy(TOUGHNESS);
+            target.vel = Vec2::new(fleeing, 0.0);
+            let out = resolve_contact(&hero, &target);
+            assert_eq!(
+                out.band, expected,
+                "an Enemy leaving at {fleeing} against a hero at {} read {:?}",
+                hero.vel.x, out.band
+            );
+        }
+        // The guard that keeps the rows above meaningful: the thresholds really
+        // are the numbers the comments assume, so a retune cannot leave this
+        // test quietly asserting the wrong boundaries.
+        assert_eq!(KICK_THRESHOLD, 2.0, "retune the rows above with the gate");
     }
 
     #[test]

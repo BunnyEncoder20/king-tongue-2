@@ -10,7 +10,28 @@ Collision is the player's bounding circle against an Enemy's bounding box. Attac
 
 ## Impact is gated on the normal component, not total speed
 
-The gate is `|m * v · n|`, the momentum component along the collision normal, never total momentum magnitude. Using total magnitude means a fast tangential pass that barely grazes an Enemy registers as a full hit, which both feels wrong and makes targeting tuning fight combat tuning.
+The gate is the momentum component along the collision normal, never total momentum magnitude. Using total magnitude means a fast tangential pass that barely grazes an Enemy registers as a full hit, which both feels wrong and makes targeting tuning fight combat tuning.
+
+### The gate is signed relative closing, not `|m * v · n|`
+
+This section was written as `|m * v · n|` with `v` the hero's velocity, and ticket #15 copied that form. **The implemented gate is `m * ((v_enemy - v_hero) · n)`, and this amendment records that the implementation is right and the absolute form was wrong.** Two separate changes, each load-bearing:
+
+**Relative, not absolute, velocity.** The two are the same number whenever the Enemy is at rest, which is every Enemy's first impact, so the absolute form was never wrong on the case it was written for. Once an earlier impact, a Kick's elastic repel or a Tongue has set an Enemy moving, relative closing is the honest reading and the hero's own speed is not: a hero at 10 catching an Enemy already travelling at 9 has barely struck it, and the absolute form would score that as a full hit at 10.
+
+**The sign is kept rather than taken as an absolute value.** `|...|` cannot tell approach from separation, so a hero leaving an Enemy it has just Kicked reads as striking it again, and the Kick band's elastic repel would then feed itself. Separating registers nothing at all, which is a fourth outcome beside the three bands and belongs to this section rather than to the band table.
+
+**The consequence, measured and not argued: the band is set by relative closing, so an Enemy already leaving can land in *any* lower band, or in none.** The review that prompted this amendment expected the divergence to be capped at one band; it is not. Against one fixed geometry and a hero whose absolute reading is 10 against a `toughness` of 4, so that the band table above calls every row Destroy:
+
+| the Enemy's own speed away | relative closing | band that actually resolves |
+|---|---|---|
+| 0 | 10 | Destroy, which is what the absolute form said |
+| 7 | 3 | Slam: one band lower |
+| 8.5 | 1.5 | Kick: two bands lower |
+| 11 | -1 | nothing registers at all |
+
+`combat::tests::an_enemy_already_moving_away_reads_a_lower_band_than_the_absolute_gate_would` is that table, so the rows are asserted rather than asserted-in-prose. A hit this ADR's band table calls Destroy can therefore resolve as a Slam, as a Kick, or as a miss, and the fleeing speeds that reach the lower rows are reachable: the two-impacts-per-tick route in `World::resolve_impacts` drains the hero while an Enemy a previous tick's Slam or Kick already set moving keeps its speed.
+
+**Whether that band structure is what the game wants is a separate question and is not settled here.** This amendment records what the gate computes and why that form supersedes the absolute one. It does not redesign the bands; if the drop from Destroy to Kick is unwanted, the fix is a decision about the bands and not about the gate.
 
 ## Three bands against one Toughness value
 
