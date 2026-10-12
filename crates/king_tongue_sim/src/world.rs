@@ -13,6 +13,7 @@ use crate::frame::{Body, BodyKind, Snapshot, TongueLine};
 use crate::input::{self, Claim, GestureTracker, TouchPhase, TouchSample};
 use crate::level::{Aabb, Level};
 use crate::movable_anchor::{self, Target};
+use crate::thrown;
 use crate::tongue::{Pulls, Tongue, Tongues};
 use crate::{
     Anchor, EntityId, DEFAULT_PLAYER_MASS, DEFAULT_PULL_STRENGTH, DT, GRAVITY, MAX_TONGUES,
@@ -119,6 +120,15 @@ pub struct World {
 /// This is what the first pass leaves behind for the second.
 #[derive(Clone, Copy, Debug)]
 struct HalfStep {
+    /// Whose half-step this is.
+    ///
+    /// Carried so that anything reading this list after a body has been removed
+    /// asks by identity rather than by slice position. The two agree while the
+    /// list is intact, and `resolve_impacts` can shorten the body list in the
+    /// middle of the tick, after which an index would silently name a different
+    /// body. The same rule the frame contract and the Movable Anchor already
+    /// follow, for the same reason.
+    id: EntityId,
     /// Where the body ended up, after integration and terrain contact.
     pos: Vec2,
     /// The velocity the body began the tick with, until the second pass
@@ -132,6 +142,15 @@ struct HalfStep {
     vel: Vec2,
     a0: Vec2,
     contacts: Contacts,
+    /// The tension the body's Tongues put on it, from this tick's first
+    /// evaluation: the Tongue force alone, over the body's own mass.
+    ///
+    /// Recorded here rather than recomputed later because it is the tension
+    /// that actually acted this tick, read at the configuration the tick began
+    /// in. ADR-0011 derives the Thrown promotion from it, and a promotion is a
+    /// mutation, so the reading has to survive the integration step and be
+    /// applied after it.
+    tension: f32,
 }
 
 impl World {
@@ -276,10 +295,19 @@ impl World {
                 hero_touching_terrain = contacts.count > 0;
             }
             half_step.push(HalfStep {
+                id: body.id,
                 pos,
                 vel: body.vel,
                 a0,
                 contacts,
+                // The Tongue force alone and not `a0`, because ADR-0011's
+                // tension is the Tongue's: gravity is not a yank, and a body
+                // with no Tongue on it at all must read zero rather than one
+                // gravity. `Pulls::force` is pure, which is what makes reading
+                // it a second time here safe: it cannot disagree with the
+                // reading inside `body_force`, and it cannot observe or change
+                // anything either reading did.
+                tension: thrown::tension(pulls.force(body.pos, body.vel), body.mass),
             });
         }
 
@@ -326,6 +354,12 @@ impl World {
             Some(start) => self.resolve_impacts(start),
             None => 0,
         };
+
+        // ADR-0011's Thrown state: what a Thrown Enemy's inverted matrix did
+        // this tick, and then which Enemies this tick's tension has taken out
+        // of their own control. Both are mutations, so they sit here with the
+        // impacts rather than anywhere a force could reach them.
+        self.resolve_thrown();
 
         // The Combo, once, after the impacts it counts and after the contact
         // that can break it. It is mutated state, so the same rule that keeps
@@ -664,6 +698,74 @@ impl World {
         // stays unimplemented rather than accidentally arriving here.
         self.bodies.retain(|b| b.toughness > 0.0);
         slams
+    }
+
+    /// Resolves ADR-0011's Thrown state for this Sim Tick: what the Thrown
+    /// bodies destroyed, and which Enemies became Thrown.
+    ///
+    /// Thin by design, like [`World::resolve_impacts`]: every rule lives in
+    /// [`crate::thrown`] as a pure function and this is wiring plus the one
+    /// place allowed to write the result back.
+    ///
+    /// **The matrix is resolved before the promotion, and the order is the
+    /// rule.** ADR-0011 gives the tracking band environmental immunity, so a
+    /// body that was below the threshold when this tick's motion began keeps
+    /// that immunity for the whole of it: it slides along terrain and is
+    /// promoted at the end of the tick, and the inverted matrix governs its
+    /// next tick. Promoting first would destroy an Enemy against the very
+    /// surface it was immune to while it was being pulled off it.
+    fn resolve_thrown(&mut self) {
+        for i in 0..self.bodies.len() {
+            if self.bodies[i].kind != BodyKind::Thrown {
+                continue;
+            }
+            // Terrain, the first row: destroyed instantly. Read off the sweep
+            // that already resolved this tick's motion rather than tested
+            // again, so "struck terrain" means exactly what the integrator
+            // means by it, swept and so immune to tunnelling at any speed.
+            if self.half_step_of(i).is_some_and(|s| s.contacts.count > 0) {
+                self.destroy(i);
+            }
+        }
+
+        // The promotion. ADR-0011: above the tension threshold the Enemy
+        // becomes Thrown, and the change is discrete, so it snaps rather than
+        // blending; ADR-0009's interpolation already does that for any change
+        // of kind.
+        for i in 0..self.bodies.len() {
+            let thrown = self
+                .half_step_of(i)
+                .is_some_and(|s| s.tension >= thrown::THROW_TENSION);
+            if thrown && self.bodies[i].kind == BodyKind::Enemy {
+                self.bodies[i].kind = BodyKind::Thrown;
+            }
+        }
+
+        // One removal for everything this function destroyed, through the same
+        // emptied pool `resolve_impacts` uses, so destruction is one rule and
+        // not two. The hero's pool is infinite, which is how the deferred hero
+        // fail state stays unimplemented rather than arriving here by accident.
+        self.bodies.retain(|b| b.toughness > 0.0);
+    }
+
+    /// This tick's half-step for the body at `index`, asked by identity.
+    ///
+    /// `None` once a body has been added mid-tick, which nothing does yet, and
+    /// never for a body that was integrated this tick. The lookup is by id
+    /// rather than by the same index because `resolve_impacts` can remove
+    /// bodies before this is read, after which the two lists no longer line up.
+    fn half_step_of(&self, index: usize) -> Option<&HalfStep> {
+        let id = self.bodies[index].id;
+        self.half_step.iter().find(|s| s.id == id)
+    }
+
+    /// Marks the body at `index` destroyed, by the one route destruction has.
+    ///
+    /// An emptied `Toughness` pool, because that is already what destruction
+    /// means everywhere else in the Core Sim. A separate flag would be a second
+    /// way to be dead for the single `retain` to disagree with.
+    fn destroy(&mut self, index: usize) {
+        self.bodies[index].toughness = 0.0;
     }
 
     fn alloc_id(&mut self) -> EntityId {
@@ -3279,5 +3381,122 @@ mod tests {
             "expected to rest on the floor at y {}, got {landed:?}",
             floor_top + PLAYER_RADIUS
         );
+    }
+
+    /// The Thrown state, through the one seam: a `Level`, Sim Ticks, and
+    /// `Snapshot`s. Nothing here reads `World` internals and nothing depends on
+    /// the order bodies happen to occupy in a list.
+    ///
+    /// ADR-0011 is the contract and ADR-0015 holds the two decisions ticket #18
+    /// had to make. The rules themselves are pure functions in
+    /// [`crate::thrown`], tested beside the module; what these assert is the
+    /// wiring, which is the part that can be wrong: whether the promotion is
+    /// read at the right point in the tick, and whether the matrix is reached
+    /// at all.
+    mod the_thrown_state {
+        use super::*;
+        use crate::thrown;
+
+        /// A hero at the origin and one Enemy `distance` units along the x
+        /// axis, with **no terrain whatsoever**.
+        ///
+        /// Horizontal so gravity contributes exactly nothing to the axis being
+        /// measured, and terrain-free so nothing in a tension measurement can
+        /// be a contact: a Thrown Enemy is destroyed by terrain, so a fixture
+        /// that measured promotion in a room would be measuring two rules at
+        /// once. The scenes that want terrain build their own below.
+        ///
+        /// `toughness` is far above anything reachable here, so the hero can
+        /// never remove the Enemy and change the body count under a test that
+        /// was measuring a state change.
+        fn yank(distance: f32, enemy_mass: f32) -> Level {
+            let level = Level {
+                world_bounds: Aabb::new(Vec2::ZERO, Vec2::splat(500.0)),
+                static_terrain: vec![],
+                player_spawn: Vec2::ZERO,
+                enemy_spawns: vec![EnemySpawn {
+                    pos: Vec2::new(distance, 0.0),
+                    toughness: 100_000.0,
+                    mass: enemy_mass,
+                }],
+            };
+            level.validate().expect("fixture must be a valid level");
+            level
+        }
+
+        /// The one Enemy in a world, by identity rather than by slice position.
+        fn enemy_of(world: &World) -> EntityId {
+            let hero = world.hero_id();
+            world
+                .snapshot()
+                .bodies
+                .iter()
+                .find(|b| b.id != hero)
+                .map(|b| b.id)
+                .expect("the fixture spawns one Enemy")
+        }
+
+        /// What kind of body the snapshot says `id` is, or `None` if it has
+        /// left the simulation.
+        fn kind_of(world: &World, id: EntityId) -> Option<BodyKind> {
+            world.snapshot().body(id).map(|b| b.kind)
+        }
+
+        /// The tension a `yank` fixture applies on its first tick, which is
+        /// pure Hooke's law over mass: the damping term is
+        /// `damping * relative_radial_vel` and is identically zero at a
+        /// standstill. ADR-0003 records this as the reason a figure measured at
+        /// rest is safe to assert against and one measured in motion is not,
+        /// which is why every analytic prediction here is a **first** tick out
+        /// of a standstill.
+        fn tension_at_rest(world: &World, distance: f32, mass: f32) -> f32 {
+            world.hero_pull_strength() * (distance - REST_LENGTH) / mass
+        }
+
+        #[test]
+        fn a_hard_enough_pull_turns_an_enemy_into_a_thrown_one_and_a_weaker_one_does_not() {
+            // ADR-0011: the tension is computed from the hero's
+            // `pull_strength`, the relative velocities, and the mass
+            // differential; below the threshold the pair merely tracks and
+            // above it the Enemy becomes Thrown.
+            //
+            // The two runs differ in the Enemy's **mass alone**, so the second
+            // is the mutation of the first rather than a different scene that
+            // might differ for some other reason, and what separates them is
+            // exactly the mass differential the AC names.
+            const DISTANCE: f32 = 14.0;
+            for (mass, expected) in [(1.0f32, BodyKind::Thrown), (2.0, BodyKind::Enemy)] {
+                let mut world = World::from_level(&yank(DISTANCE, mass));
+                let enemy = enemy_of(&world);
+                let tension = tension_at_rest(&world, DISTANCE, mass);
+                // The fixture must straddle the threshold, or neither run says
+                // anything. Asserted rather than assumed: a later change to
+                // `DEFAULT_PULL_STRENGTH` or to the threshold would otherwise
+                // leave both runs on the same side of it and both assertions
+                // below would still pass for one of them.
+                assert_eq!(
+                    tension >= thrown::THROW_TENSION,
+                    expected == BodyKind::Thrown,
+                    "the fixture puts {tension} on the wrong side of \
+                     {} at Enemy mass {mass}",
+                    thrown::THROW_TENSION
+                );
+
+                tap(&mut world, 1, Vec2::new(DISTANCE, 0.0));
+                world.step();
+
+                assert!(
+                    slot_anchor(&world, 0).is_some(),
+                    "the fixture must Attach to the Enemy, or no tension acts at all"
+                );
+                assert_eq!(
+                    kind_of(&world, enemy),
+                    Some(expected),
+                    "at Enemy mass {mass} the tension was {tension} against a \
+                     threshold of {}",
+                    thrown::THROW_TENSION
+                );
+            }
+        }
     }
 }

@@ -21,6 +21,7 @@ pub mod frame;
 pub mod input;
 pub mod level;
 pub mod movable_anchor;
+pub mod thrown;
 pub mod tongue;
 pub mod world;
 
