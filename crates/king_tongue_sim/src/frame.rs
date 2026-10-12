@@ -137,6 +137,14 @@ pub struct Snapshot {
     pub bodies: Vec<Body>,
     /// Only attached Tongues appear. An absent slot is not drawn at all.
     pub tongues: Vec<TongueLine>,
+    /// The Combo: how many Slams the current unbroken run is worth, zero when
+    /// there is no run. See [`crate::combo`].
+    ///
+    /// A count and not a score, per ADR-0011. This is how the Core Sim exposes
+    /// it for the Shell to read, and the Shell may draw it or derive a
+    /// multiplier from it; deciding anything simulated with it would be the
+    /// branching game logic ADR-0001 keeps out of the Shell.
+    pub combo: u32,
 }
 
 impl Snapshot {
@@ -192,6 +200,11 @@ fn lerp_facing(a: Vec2, b: Vec2, t: f32) -> Vec2 {
 pub fn interpolate_into(previous: &Snapshot, current: &Snapshot, alpha: f32, out: &mut Snapshot) {
     let t = alpha.clamp(0.0, 1.0);
     out.tick = current.tick;
+    // Carried across unblended. A Combo is a count of hits, so a value between
+    // two of them does not exist: blending 3 toward 4 would draw 3.6 hits for
+    // most of a frame. ADR-0002 excludes discrete events from interpolation and
+    // a hit landing is exactly one.
+    out.combo = current.combo;
     out.bodies.clear();
     out.tongues.clear();
 
@@ -290,11 +303,13 @@ mod tests {
     #[test]
     fn matched_bodies_interpolate() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![body(7, BodyKind::Hero, Vec2::new(0.0, 0.0))],
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![body(7, BodyKind::Hero, Vec2::new(10.0, 0.0))],
             tongues: vec![],
@@ -310,6 +325,7 @@ mod tests {
         // the hero's index shifts. Index matching would blend the hero against
         // the dead Enemy's position and slide it across the level.
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![
                 body(1, BodyKind::Enemy, Vec2::new(-100.0, 0.0)),
@@ -318,6 +334,7 @@ mod tests {
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![body(2, BodyKind::Hero, Vec2::new(2.0, 0.0))],
             tongues: vec![],
@@ -332,11 +349,13 @@ mod tests {
     #[test]
     fn spawned_body_does_not_slide_in_from_elsewhere() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![],
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![body(9, BodyKind::Enemy, Vec2::new(50.0, 50.0))],
             tongues: vec![],
@@ -353,11 +372,13 @@ mod tests {
     #[test]
     fn kind_change_snaps_because_it_is_a_discrete_event() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![body(4, BodyKind::Enemy, Vec2::new(0.0, 0.0))],
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![body(4, BodyKind::Thrown, Vec2::new(8.0, 0.0))],
             tongues: vec![],
@@ -371,11 +392,13 @@ mod tests {
     #[test]
     fn newly_fired_tongue_does_not_stretch_out_of_nowhere() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![],
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![],
             tongues: vec![TongueLine {
@@ -397,6 +420,7 @@ mod tests {
     #[test]
     fn retargeted_tongue_does_not_sweep_across_the_level() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![],
             tongues: vec![TongueLine {
@@ -407,6 +431,7 @@ mod tests {
             }],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![],
             tongues: vec![TongueLine {
@@ -433,6 +458,7 @@ mod tests {
         // slot held one Tongue forever; reachable the moment a tap can Release
         // one and another can re-fire into the same slot.
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![],
             tongues: vec![TongueLine {
@@ -443,6 +469,7 @@ mod tests {
             }],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![],
             tongues: vec![TongueLine {
@@ -471,6 +498,7 @@ mod tests {
         // unchanged here, and identity is what must be compared.
         let enemy = Anchor::Movable(EntityId(3));
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![],
             tongues: vec![TongueLine {
@@ -481,6 +509,7 @@ mod tests {
             }],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![],
             tongues: vec![TongueLine {
@@ -497,6 +526,46 @@ mod tests {
             Vec2::new(5.0, 0.0),
             "the same Enemy at a new position must blend, not snap"
         );
+    }
+
+    #[test]
+    fn the_combo_count_is_carried_across_whole_rather_than_blended() {
+        // A Combo is a count of hits, so there is no value between two of them:
+        // blending three toward four would have the Shell draw 3.5 hits for
+        // half a frame. ADR-0002 keeps discrete events out of interpolation and
+        // a hit landing is exactly one, so the latest count is carried through
+        // untouched at every alpha.
+        let prev = Snapshot {
+            combo: 3,
+            tick: 1,
+            bodies: vec![],
+            tongues: vec![],
+        };
+        let cur = Snapshot {
+            combo: 4,
+            tick: 2,
+            bodies: vec![],
+            tongues: vec![],
+        };
+        let mut out = Snapshot::default();
+        for alpha in [0.0, 0.25, 0.5, 0.999, 1.0] {
+            interpolate_into(&prev, &cur, alpha, &mut out);
+            assert_eq!(
+                out.combo, 4,
+                "at alpha {alpha} the view must carry the current count"
+            );
+        }
+
+        // And a broken run reads as broken immediately, rather than fading out
+        // of the previous snapshot's count.
+        let broken = Snapshot {
+            combo: 0,
+            tick: 3,
+            bodies: vec![],
+            tongues: vec![],
+        };
+        interpolate_into(&cur, &broken, 0.5, &mut out);
+        assert_eq!(out.combo, 0, "a Combo that broke must read as broken");
     }
 
     #[test]
@@ -521,11 +590,13 @@ mod tests {
     #[test]
     fn interpolation_reuses_the_output_buffer() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![],
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![body(1, BodyKind::Hero, Vec2::ZERO)],
             tongues: vec![],

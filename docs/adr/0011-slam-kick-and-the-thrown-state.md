@@ -38,6 +38,24 @@ Expiry is a decaying countdown window that tightens as hits mount and settles at
 
 This rule is explicitly provisional and expected to be retuned against real gameplay.
 
+**"Comes to rest" is a speed threshold sustained in terrain contact: under 0.5 world units per second for 6 consecutive Sim Ticks.** The phrase was undefined everywhere it appeared, and ticket #19 had to choose a predicate to implement one. Half a hero radius per second sits far above the float residue of a resting contact, which is a few thousandths of a unit per second, and far below anything a Swing, a fall, or a bounce travels at, so the band between the two is wide and nothing has to be measured precisely for the rule to read correctly. Deliberately the most obvious predicate available rather than the best one, because the whole rule is provisional: both numbers are one constant each, and the tuning they will get is a different value in the same shape.
+
+**Sustaining it is the half that is load-bearing, and an instantaneous version is a real defect rather than a simplification.** Terrain contact cancels the component of motion heading into the surface, so a hero arriving nearly straight down has almost no speed at all for exactly the tick it lands, while being thrown straight back up by a loaded Tongue. On a one-tick predicate that reads as a standstill, and the run dies on the player's best landing. A tenth of a second is long enough that a bounce cannot reach it and short enough to stay under a sixth of the shortest window, so it never competes with the countdown.
+
+The predicate reads terrain and not an Enemy. ADR-0011 breaks the Combo on coming to rest **on a surface**, and an Enemy is a target rather than a surface: coming to rest against one is already the Kick band's business, and the hero drifting to a halt on an Enemy it cannot hurt should not be a second way to lose a run.
+
+**Both bands above the Kick threshold count as hits.** The GLOSSARY defines a Slam as a collision carrying momentum above the Kick threshold, which makes spending momentum against a `toughness` pool and emptying it outright the same hit landed against different Enemies. A Kick is the band that explicitly is not a Slam. The count is of Slams and not of impacts, and more than one can land in a single Sim Tick, because a hero past the pass-through ceiling crosses two Enemy boxes inside one tick.
+
+The window is 120 Sim Ticks at one hit, tightening by 6 per hit to a floor of 36: two seconds down to six tenths, which is roughly the time a Release and a re-Attach take at the baseline hero's pull strength. The floor binds from 15 hits on. A Sim Tick that lands a Slam is not counted as drought, so the tolerated gap between two hits is exactly the window rather than one tick less than it.
+
+"The countdown governs airborne droughts only" is read as saying what the countdown is not, rather than as a condition on when it runs: it is the rule for gaps between hits, and it is not the rule for touching the ground, which the rest predicate owns. The countdown therefore keeps running while the hero is in contact with terrain and moving. The alternative reading pauses it during contact, and that is wrong in a world with no friction: a hero skidding along a floor just above the rest threshold would hold a Combo open indefinitely without hitting anything.
+
+**The wave freeze is not implemented, and that is deliberate.** There is no wave system: the spec defers it in the map's fog, and the paragraph above already notes that this rule presumes a concept that does not exist. A freeze implemented now would have nothing to start it and nothing to end it, so building it would mean inventing the wave system from the Combo's side. The seam is the Core Sim's single per-tick Combo entry point, where a wave transition arrives as one more reason the countdown declines to advance, beside the case where no Combo is live.
+
+The Combo count is published in the `Snapshot` and carried through interpolation whole rather than blended, because a count has no value between two hits and ADR-0002 keeps discrete events out of interpolation. That is the whole of what the Shell gets: ADR-0009's snapshot is the only thing the Shell reads, and the multiplier derived from the count stays there.
+
+Recorded while implementing ticket #19.
+
 ## The Thrown state
 
 A Tongue attached to an Enemy computes a tension force from the hero's `pull_strength`, the relative velocities, and the mass differential. Below the tension threshold the pair tracks toward each other by mass ratio, and the Enemy has environmental immunity: sliding into terrain does nothing but bounding-box slide physics.

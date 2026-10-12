@@ -7,6 +7,7 @@
 //! snapshots this type retains.
 
 use crate::combat;
+use crate::combo::{Combo, HeroState};
 use crate::despawn;
 use crate::frame::{Body, BodyKind, Snapshot, TongueLine};
 use crate::input::{self, Claim, GestureTracker, TouchPhase, TouchSample};
@@ -90,6 +91,10 @@ pub struct World {
     /// Hooke's `k` for the hero's Tongues. A per-hero parameter like `mass`,
     /// not a character system.
     hero_pull_strength: f32,
+    /// The hero's unbroken run of Slams. Mutated once per Sim Tick, from
+    /// [`World::step`] alone, and deliberately unreachable from `body_force`:
+    /// see [`crate::combo`].
+    combo: Combo,
     /// Monotonic. Never reused within a run, because interpolation matches
     /// bodies on identity and a recycled id would blend two different bodies
     /// into each other.
@@ -141,6 +146,7 @@ impl World {
             tongues: [None; MAX_TONGUES],
             gestures: GestureTracker::new(),
             hero_pull_strength: DEFAULT_PULL_STRENGTH,
+            combo: Combo::default(),
             next_id: 0,
             tick: 0,
             current: Snapshot::default(),
@@ -240,6 +246,11 @@ impl World {
             .find(|b| b.id == self.hero)
             .map(|b| b.pos);
 
+        // Whether the hero ended the tick against terrain, read off the sweep
+        // that resolved it rather than re-derived afterwards. The Combo's rest
+        // predicate needs it, and the sweep is the only thing that knows.
+        let mut hero_touching_terrain = false;
+
         // Taken out of `self` rather than borrowed, so the force evaluation can
         // keep reading every body while this is being filled. Put back at the
         // end of the tick, so its capacity survives and a warm tick allocates
@@ -261,6 +272,9 @@ impl World {
             // keeps `body_force` pure: contact is resolved out here, once, and
             // never inside an acceleration that gets evaluated twice.
             let (pos, contacts) = sweep(body.pos, target, PLAYER_RADIUS, &self.static_terrain);
+            if body.id == self.hero {
+                hero_touching_terrain = contacts.count > 0;
+            }
             half_step.push(HalfStep {
                 pos,
                 vel: body.vel,
@@ -308,9 +322,30 @@ impl World {
         // Impacts are impulses and not forces, so they are resolved here, once,
         // after the integration step. Putting any of this inside `body_force`
         // would have ADR-0007's integrator apply it twice per Sim Tick.
-        if let Some(start) = hero_start {
-            self.resolve_impacts(start);
-        }
+        let slams = match hero_start {
+            Some(start) => self.resolve_impacts(start),
+            None => 0,
+        };
+
+        // The Combo, once, after the impacts it counts and after the contact
+        // that can break it. It is mutated state, so the same rule that keeps
+        // impacts out of `body_force` keeps this out: ADR-0007's integrator
+        // evaluates acceleration twice per Sim Tick, and a count advanced from
+        // inside a force would advance twice as fast with nothing to say so.
+        // Everything it decides on lives in [`crate::combo`]; this is wiring.
+        self.combo.after_impacts(
+            slams,
+            HeroState {
+                touching_terrain: hero_touching_terrain,
+                // End of tick, so an impact that drained the hero is already in
+                // it. A hero whose momentum a Slam just took is slower for the
+                // rest predicate's purposes on this tick, not the next one.
+                speed: self
+                    .body(self.hero)
+                    .map(|b| b.vel.length())
+                    .unwrap_or_default(),
+            },
+        );
 
         // Despawn last, and here rather than anywhere else in the tick. It is a
         // mutation, so it must not be reachable from `body_force`, which
@@ -535,7 +570,13 @@ impl World {
 
     fn write_current_snapshot(&mut self) {
         let lines = self.tongue_lines();
-        write_snapshot(self.tick, &self.bodies, &lines, &mut self.current);
+        write_snapshot(
+            self.tick,
+            self.combo.hits(),
+            &self.bodies,
+            &lines,
+            &mut self.current,
+        );
     }
 
     /// The Attached Tongues as the Shell draws them: hero to Anchor.
@@ -564,17 +605,23 @@ impl World {
         self.body(id).map(|b| b.vel)
     }
 
-    /// Resolves the hero's pass over this Sim Tick against every Enemy, and
-    /// removes whatever it destroyed.
+    /// Resolves the hero's pass over this Sim Tick against every Enemy, removes
+    /// whatever it destroyed, and reports how many Slams landed.
     ///
     /// Thin by design: every rule lives in [`crate::combat`] as a pure function,
     /// and this is the one place in the tick allowed to write the result back.
     /// Enemies are visited in body order, which is stable for a run, so the
     /// outcome of a tick that touches two of them is deterministic.
-    fn resolve_impacts(&mut self, hero_start: Vec2) {
+    ///
+    /// The count returned is of Slams and not of impacts: a Kick is not a hit.
+    /// More than one can land in a single tick, because a hero fast enough to
+    /// clear the pass-through ceiling crosses two Enemy boxes inside one Sim
+    /// Tick, and both are hits.
+    fn resolve_impacts(&mut self, hero_start: Vec2) -> u32 {
         let Some(h) = self.bodies.iter().position(|b| b.id == self.hero) else {
-            return;
+            return 0;
         };
+        let mut slams = 0;
 
         for i in 0..self.bodies.len() {
             if self.bodies[i].kind != BodyKind::Enemy {
@@ -606,12 +653,17 @@ impl World {
             self.bodies[i].vel = resolved.enemy_vel;
             self.bodies[i].toughness = resolved.toughness;
             self.bodies[i].touching_hero = resolved.touching;
+
+            if Combo::counts_as_slam(resolved.band) {
+                slams += 1;
+            }
         }
 
         // An emptied pool is destruction, so there is one rule and not two. The
         // hero's pool is infinite, which is how the deferred hero fail state
         // stays unimplemented rather than accidentally arriving here.
         self.bodies.retain(|b| b.toughness > 0.0);
+        slams
     }
 
     fn alloc_id(&mut self) -> EntityId {
@@ -884,11 +936,13 @@ fn crossing(origin: Vec2, motion: Vec2, aabb: Aabb, radius: f32) -> Option<(f32,
 /// their capacity across ticks instead of reallocating per tick.
 fn write_snapshot(
     tick: u64,
+    combo: u32,
     bodies: &[BodyState],
     tongues: &[Option<TongueLine>],
     out: &mut Snapshot,
 ) {
     out.tick = tick;
+    out.combo = combo;
     out.bodies.clear();
     out.tongues.clear();
     for b in bodies {
@@ -910,6 +964,7 @@ fn write_snapshot(
 mod tests {
     use super::*;
 
+    use crate::level::EnemySpawn;
     use crate::tongue;
     use crate::{DEFAULT_DAMPING, DEFAULT_FORCE_CEILING, REST_LENGTH};
 
@@ -2650,6 +2705,532 @@ mod tests {
                 "a Tongue was dropped at tick {tick}, so the pulls stopped opposing"
             );
         }
+    }
+
+    /// An enclosed corridor with a row of Enemies at the hero's height.
+    ///
+    /// Written flush to the left margin for the reason `room` is: `from_ascii`
+    /// counts leading spaces as columns, so an indented sketch is the same
+    /// scene shifted right and none of the coordinates here would hold.
+    ///
+    /// Walls at `x = 1` and `x = 17`, floor top at `y = 1`, hero at
+    /// `(1.5, 2.5)`, Enemies at `(3.5, 2.5)`, `(5.5, 2.5)` and `(7.5, 2.5)`.
+    fn corridor() -> Level {
+        Level::from_ascii(
+            "\
+##################
+#................#
+#@.e.e.e.........#
+#................#
+##################
+",
+        )
+    }
+
+    /// A short enclosed alley with one Enemy between the hero and the left
+    /// wall, so a hero sent left Slams it and then runs out of room.
+    ///
+    /// Flush left: the coordinates here are absolute. Left wall face at
+    /// `x = 1`, floor top at `y = 1`, Enemy at `(2.5, 1.5)`, hero at
+    /// `(3.5, 1.5)`, which is exactly its resting height on the floor.
+    fn alley() -> Level {
+        Level::from_ascii(
+            "\
+##########
+#........#
+#.e@.....#
+##########
+",
+        )
+    }
+
+    /// A long hall with a floor to land on and a ceiling to Attach to, plus one
+    /// Enemy in the hero's path.
+    ///
+    /// Built by hand rather than sketched because it is 120 units long. Floor
+    /// top at `y = 0`, ceiling bottom at `y = 20`, hero spawning at
+    /// `(2.0, 10.0)`, Enemy at `(10.0, 10.0)`. The Kill Bound is far outside
+    /// all of it, so nothing despawns in the middle of a measurement.
+    fn hall() -> Level {
+        let level = Level {
+            world_bounds: Aabb::new(Vec2::new(60.0, 10.0), Vec2::splat(400.0)),
+            static_terrain: vec![
+                Aabb::new(Vec2::new(60.0, -0.5), Vec2::new(60.0, 0.5)),
+                Aabb::new(Vec2::new(60.0, 20.5), Vec2::new(60.0, 0.5)),
+            ],
+            player_spawn: Vec2::new(2.0, 10.0),
+            enemy_spawns: vec![EnemySpawn {
+                pos: Vec2::new(10.0, 10.0),
+                toughness: 100.0,
+                mass: 1.0,
+            }],
+        };
+        level.validate().expect("fixture must be a valid level");
+        level
+    }
+
+    /// Launches the hero into the hall's Enemy hard enough to destroy it and
+    /// returns the Sim Tick the hit landed on, failing if it never did.
+    ///
+    /// A Combo cannot be tested without a hit to start it, and a test that
+    /// assumed which tick the hit fell on would be asserting the fixture's
+    /// arithmetic rather than the rule under test.
+    fn slam_the_hall(world: &mut World) -> u64 {
+        world.place(world.hero_id(), Vec2::new(2.0, 10.0), Vec2::new(120.0, 0.0));
+        for _ in 0..20 {
+            world.step();
+            if world.snapshot().combo == 1 {
+                return world.snapshot().tick;
+            }
+        }
+        panic!("the fixture never landed a Slam, so nothing below proves anything");
+    }
+
+    #[test]
+    fn each_slam_increments_the_combo_count() {
+        // GLOSSARY: a Combo is an unbroken run of Slams, and it is a count of
+        // hits. ADR-0011 makes it uncapped and keeps it in the Core Sim.
+        let mut world = World::from_level(&corridor());
+        assert_eq!(
+            world.snapshot().combo,
+            0,
+            "nothing has been hit, so there is no Combo yet"
+        );
+
+        // Momentum assigned rather than earned by Swinging, as the combat
+        // tests do: this is about what an impact does to the count.
+        world.place(world.hero_id(), Vec2::new(1.5, 2.5), Vec2::new(120.0, 0.0));
+
+        // Two units of travel at two units per tick reaches the first Enemy,
+        // so the first hit lands on the first tick.
+        world.step();
+        assert_eq!(
+            world.snapshot().combo,
+            1,
+            "the first Slam must put the count at one"
+        );
+
+        // Three Enemies in the row, each hit once, so the run ends at three.
+        // Each impact drains the hero, which is what makes the later hits
+        // weaker rather than faster, but every one of them is above the Kick
+        // threshold and so is a Slam.
+        let mut previous = 1;
+        for _ in 0..20 {
+            world.step();
+            let now = world.snapshot().combo;
+            assert!(
+                now >= previous,
+                "an unbroken run must never count down: {previous} then {now}"
+            );
+            previous = now;
+        }
+        assert_eq!(previous, 3, "three Enemies hit once each is three hits");
+    }
+
+    #[test]
+    fn a_kick_does_not_count_as_a_hit() {
+        // The Combo counts Slams, and a Kick is defined as the band below the
+        // Slam threshold. Without this the count would be of impacts, and
+        // drifting gently into an Enemy would read as combat.
+        let mut world = World::from_level(&corridor());
+        // One unit per second at the baseline hero's mass is one momentum unit,
+        // half the Kick threshold, and the Enemy is a unit away.
+        world.place(world.hero_id(), Vec2::new(2.4, 2.5), Vec2::new(1.0, 0.0));
+
+        let enemy_before = *world
+            .snapshot()
+            .bodies
+            .iter()
+            .find(|b| b.kind == BodyKind::Enemy)
+            .expect("the corridor has Enemies");
+
+        for _ in 0..30 {
+            world.step();
+            assert_eq!(
+                world.snapshot().combo,
+                0,
+                "a Kick is not a Slam, so it must not start a Combo"
+            );
+        }
+
+        // And the drift really did reach the Enemy, or the loop above proved
+        // only that nothing happened.
+        let enemy_now = *world
+            .snapshot()
+            .body(enemy_before.id)
+            .expect("a Kick must not destroy the Enemy");
+        assert!(
+            enemy_now.pos.x > enemy_before.pos.x,
+            "the Enemy was never Kicked: {enemy_before:?} then {enemy_now:?}"
+        );
+    }
+
+    #[test]
+    fn mere_ground_contact_does_not_break_the_combo() {
+        // ADR-0011 breaks the Combo on coming to rest and explicitly not on
+        // ground contact. A hero skidding along the floor at speed is in
+        // contact on every single tick, and the run has to survive all of it.
+        let mut world = World::from_level(&alley());
+        let hero_id = world.hero_id();
+        world.place(hero_id, Vec2::new(3.5, 1.5), Vec2::new(-10.0, 0.0));
+        world.step();
+        assert_eq!(world.snapshot().combo, 1, "the fixture must land a Slam");
+
+        // The hero slides left along the floor at half the speed it arrived
+        // with, the Slam having drained the rest.
+        for tick in 0..20 {
+            world.step();
+            let pos = hero(&world).pos;
+            let speed = world
+                .body_velocity(hero_id)
+                .expect("the hero is alive")
+                .length();
+            assert!(
+                (pos.y - (1.0 + PLAYER_RADIUS)).abs() < 1e-3,
+                "the fixture must keep the hero on the floor: tick {tick}, {pos:?}"
+            );
+            assert!(
+                speed > crate::combo::REST_SPEED,
+                "the fixture must keep the hero moving: tick {tick}, speed {speed}"
+            );
+            assert_eq!(
+                world.snapshot().combo,
+                1,
+                "ground contact at speed must not break the Combo: tick {tick}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_combo_breaks_when_the_hero_comes_to_rest_on_a_surface() {
+        // The other half of the same rule, and the predicate this ticket had to
+        // choose: sustained slow contact with terrain. Recorded in ADR-0011.
+        let mut world = World::from_level(&alley());
+        let hero_id = world.hero_id();
+        world.place(hero_id, Vec2::new(3.5, 1.5), Vec2::new(-10.0, 0.0));
+        world.step();
+        assert_eq!(world.snapshot().combo, 1, "the fixture must land a Slam");
+        let slam_tick = world.snapshot().tick;
+
+        // Left along the floor until the wall takes the last of the momentum.
+        let mut broke_on = None;
+        for _ in 0..200 {
+            world.step();
+            if world.snapshot().combo == 0 {
+                broke_on = Some(world.snapshot().tick);
+                break;
+            }
+        }
+        let broke_on = broke_on.expect("the Combo must end once the hero stops");
+
+        // The countdown is 120 ticks at one hit, so a break this early can only
+        // be the hero coming to rest. Without this the test would pass for a
+        // Combo that merely timed out, which is a different rule.
+        let drought = broke_on - slam_tick;
+        assert!(
+            drought < 60,
+            "the Combo lasted {drought} ticks, which is long enough to be the \
+             countdown rather than the hero coming to rest"
+        );
+
+        // And the hero really is at a standstill against the floor, not merely
+        // somewhere the implementation guessed at.
+        let speed = world
+            .body_velocity(hero_id)
+            .expect("the hero is alive")
+            .length();
+        let pos = hero(&world).pos;
+        assert!(
+            speed < crate::combo::REST_SPEED,
+            "the hero must be still when the Combo breaks, speed {speed}"
+        );
+        assert!(
+            (pos.y - (1.0 + PLAYER_RADIUS)).abs() < 1e-3,
+            "the hero must be resting on the floor, got {pos:?}"
+        );
+        let settled = pos;
+        for _ in 0..30 {
+            world.step();
+        }
+        assert!(
+            (hero(&world).pos - settled).length() < 1e-3,
+            "the hero must have stopped, not slowed: {settled:?} then {:?}",
+            hero(&world).pos
+        );
+    }
+
+    #[test]
+    fn the_combo_survives_a_bounce_off_the_ground() {
+        // Story 38: a glancing touch of the ground must not punish the player.
+        // Terrain contact carries no restitution, so the only way the hero
+        // leaves the floor it just hit is a Tongue hauling it back up, which is
+        // exactly the case the rule is about: contact the hero does not stay in.
+        let mut world = World::from_level(&hall());
+        let hero_id = world.hero_id();
+        let slam_tick = slam_the_hall(&mut world);
+
+        // Anchored overhead, then dropped at the floor underneath it so the
+        // Stretch is loaded and the hero is thrown straight back up.
+        let anchor = attach(&mut world, Vec2::new(0.0, 20.0));
+        world.place(hero_id, Vec2::new(anchor.x, 0.6), Vec2::new(20.0, -30.0));
+
+        world.step();
+        let touched = hero(&world).pos;
+        assert!(
+            (touched.y - PLAYER_RADIUS).abs() < 1e-3,
+            "the fixture must actually reach the floor, got {touched:?}"
+        );
+        assert_eq!(
+            world.snapshot().combo,
+            1,
+            "touching the ground must not break the Combo"
+        );
+
+        // And back up again, with the count intact the whole way.
+        let mut left_on = None;
+        for _ in 0..30 {
+            world.step();
+            assert_eq!(
+                world.snapshot().combo,
+                1,
+                "the Combo must survive the whole bounce"
+            );
+            if hero(&world).pos.y > 2.0 {
+                left_on = Some(world.snapshot().tick);
+                break;
+            }
+        }
+        let left_on = left_on.expect("the fixture never bounced back off the floor");
+
+        // Inside the window, so this measured a bounce and not a timeout.
+        assert!(
+            left_on - slam_tick < 120,
+            "the bounce took {} ticks, longer than the countdown it has to fit \
+             inside",
+            left_on - slam_tick
+        );
+    }
+
+    #[test]
+    fn a_single_tick_of_slow_ground_contact_is_not_coming_to_rest() {
+        // Why the rest predicate has to be sustained rather than instantaneous,
+        // which is the half of it a bounce with sideways speed never exercises.
+        // Terrain contact cancels the motion heading into the surface, so a
+        // hero arriving straight down at thirty units per second has a speed of
+        // almost nothing for exactly one tick while being thrown straight back
+        // up. On a one-tick predicate that reads as a standstill and the run
+        // dies on the player's best landing.
+        let mut world = World::from_level(&hall());
+        let hero_id = world.hero_id();
+        slam_the_hall(&mut world);
+
+        let anchor = attach(&mut world, Vec2::new(0.0, 20.0));
+        world.place(hero_id, Vec2::new(anchor.x, 0.6), Vec2::new(0.2, -30.0));
+
+        world.step();
+        let speed = world
+            .body_velocity(hero_id)
+            .expect("the hero is alive")
+            .length();
+        let pos = hero(&world).pos;
+        assert!(
+            (pos.y - PLAYER_RADIUS).abs() < 1e-3,
+            "the fixture must land the hero on the floor, got {pos:?}"
+        );
+        assert!(
+            speed < crate::combo::REST_SPEED,
+            "the fixture must leave the hero momentarily slower than the rest \
+             threshold, or it proves nothing: speed {speed}"
+        );
+        assert_eq!(
+            world.snapshot().combo,
+            1,
+            "one tick of slow contact is a landing, not a standstill"
+        );
+
+        // And it was genuinely one tick: the hero is away again immediately,
+        // which is what distinguishes this from the standstill case.
+        world.step();
+        assert!(
+            hero(&world).pos.y > PLAYER_RADIUS,
+            "the fixture must leave the floor again, got {:?}",
+            hero(&world).pos
+        );
+        assert_eq!(world.snapshot().combo, 1, "the Combo must have survived");
+    }
+
+    #[test]
+    fn the_combo_survives_a_release_and_a_re_attach() {
+        // Story 37, and ADR-0011's "persisting across Release and re-attach":
+        // chaining between Anchors is the high-skill line, so letting go must
+        // not cost the run. Every stage below is inside the 120 tick window a
+        // one-hit Combo gets.
+        let mut world = World::from_level(&hall());
+        let slam_tick = slam_the_hall(&mut world);
+
+        attach(&mut world, Vec2::new(0.0, 20.0));
+        for _ in 0..10 {
+            world.step();
+        }
+        assert_eq!(world.snapshot().tongues.len(), 1, "the Tongue must Attach");
+        assert_eq!(world.snapshot().combo, 1, "Attaching must not cost the run");
+
+        // The second tap on an occupied slot is a Release, per ADR-0006.
+        lift(&mut world, 1);
+        tap_toward(&mut world, 2, Vec2::Y);
+        world.step();
+        assert!(
+            world.snapshot().tongues.is_empty(),
+            "the second tap must have Released: {:?}",
+            world.snapshot().tongues
+        );
+        assert_eq!(
+            world.snapshot().combo,
+            1,
+            "a Release must not break the Combo"
+        );
+
+        for _ in 0..10 {
+            world.step();
+            assert_eq!(
+                world.snapshot().combo,
+                1,
+                "the Combo must survive unconstrained ballistic flight"
+            );
+        }
+
+        // Re-Attach, which is the half of the rule a Release alone would not
+        // catch: the count has to survive the slot being filled again.
+        lift(&mut world, 2);
+        tap_toward(&mut world, 3, Vec2::new(0.0, 20.0));
+        world.step();
+        assert_eq!(
+            world.snapshot().tongues.len(),
+            1,
+            "the third tap must re-Attach: {:?}",
+            world.snapshot().tongues
+        );
+        assert_eq!(
+            world.snapshot().combo,
+            1,
+            "a re-Attach must not break the Combo"
+        );
+
+        for _ in 0..20 {
+            world.step();
+            assert_eq!(world.snapshot().combo, 1, "the run must still be live");
+        }
+        assert!(
+            world.snapshot().tick - slam_tick < 120,
+            "the sequence outran the countdown, so a break here would be \
+             ambiguous"
+        );
+    }
+
+    /// A straight line of touching Enemies with no terrain anywhere.
+    ///
+    /// No terrain at all is the point: with nothing to come to rest on, the
+    /// only thing that can end a Combo here is the countdown, which is what
+    /// makes the window measurable. The Kill Bound is wide enough that a hero
+    /// at the pass-through ceiling cannot reach it inside the longest window.
+    fn slam_row(count: u32) -> Level {
+        let level = Level {
+            world_bounds: Aabb::new(Vec2::ZERO, Vec2::splat(5_000.0)),
+            static_terrain: vec![],
+            player_spawn: Vec2::ZERO,
+            enemy_spawns: (0..count)
+                .map(|i| EnemySpawn {
+                    pos: Vec2::new(2.0 + i as f32, 0.0),
+                    toughness: 100.0,
+                    mass: 1.0,
+                })
+                .collect(),
+        };
+        level.validate().expect("fixture must be a valid level");
+        level
+    }
+
+    /// Runs the hero through `count` Enemies above the pass-through ceiling and
+    /// reports the Combo it reached and how many Sim Ticks passed between its
+    /// last hit and its expiry.
+    ///
+    /// Above [`combat::PASS_THROUGH_MOMENTUM`] an impact drains nothing, so the
+    /// hero crosses the whole row at one speed and every Enemy in it is a hit.
+    /// That is what makes the hit count the fixture's choice rather than an
+    /// emergent property of the drain.
+    fn measure_window(count: u32) -> (u32, u64) {
+        let mut world = World::from_level(&slam_row(count));
+        world.place(world.hero_id(), Vec2::ZERO, Vec2::new(160.0, 0.0));
+
+        let mut hits = 0;
+        let mut last_hit = 0;
+        for _ in 0..2_000 {
+            world.step();
+            let snapshot = world.snapshot();
+            if snapshot.combo > hits {
+                hits = snapshot.combo;
+                last_hit = snapshot.tick;
+            } else if hits > 0 && snapshot.combo == 0 {
+                return (hits, snapshot.tick - last_hit);
+            }
+        }
+        panic!("a Combo of {hits} hits never expired");
+    }
+
+    #[test]
+    fn the_countdown_window_tightens_as_hits_mount() {
+        // Story 40: long chains get harder rather than coasting. The windows
+        // are stated as times, which is what they were chosen as, and ADR-0002
+        // locks the tick so the conversion is exact.
+        let (one_hit, short_run) = measure_window(1);
+        assert_eq!(one_hit, 1, "the fixture must land exactly one hit");
+        assert_eq!(
+            short_run, 120,
+            "a one-hit Combo gets two seconds to find its next Slam"
+        );
+
+        let (six_hits, long_run) = measure_window(6);
+        assert_eq!(six_hits, 6, "the fixture must land exactly six hits");
+        assert_eq!(
+            long_run, 90,
+            "six hits should be down to a second and a half"
+        );
+        assert!(
+            long_run < short_run,
+            "the window did not tighten: {short_run} ticks at one hit, \
+             {long_run} at six"
+        );
+    }
+
+    #[test]
+    fn the_countdown_window_stops_shrinking_at_a_hard_floor() {
+        // Story 41: a long Combo has to stay humanly possible, so the
+        // tightening settles rather than converging on zero. Twenty hits is
+        // past where the floor binds and forty is far past it; both get the
+        // same window, and it is not nothing.
+        let (twenty, twenty_window) = measure_window(20);
+        let (forty, forty_window) = measure_window(40);
+
+        assert_eq!(twenty, 20, "the fixture must land exactly twenty hits");
+        assert_eq!(forty, 40, "the fixture must land exactly forty hits");
+        assert_eq!(
+            twenty_window, 36,
+            "a long Combo keeps six tenths of a second"
+        );
+        assert_eq!(
+            forty_window, twenty_window,
+            "the floor must hold however long the run gets: {twenty_window} \
+             ticks at twenty hits against {forty_window} at forty"
+        );
+    }
+
+    #[test]
+    fn the_combo_is_an_uncapped_count_and_never_a_score() {
+        // Story 36, and ADR-0011's standing constraint: the Core Sim tracks a
+        // count. Forty Slams is forty, not a multiplier, not a capped value,
+        // and not a number scaled by anything.
+        let (hits, _) = measure_window(40);
+        assert_eq!(hits, 40, "forty Slams must read as exactly forty hits");
     }
 
     #[cfg(feature = "serde")]
