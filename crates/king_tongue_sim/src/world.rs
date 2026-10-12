@@ -6,7 +6,7 @@
 //! fixed Sim Tick, ADR-0007 for the integrator, and ADR-0009 for the two
 //! snapshots this type retains.
 
-use crate::combat::{self, ENEMY_HALF_EXTENTS};
+use crate::combat;
 use crate::combo::{Combo, HeroState};
 use crate::despawn;
 use crate::frame::{Body, BodyKind, Snapshot, TongueLine};
@@ -129,6 +129,11 @@ struct HalfStep {
     /// body. The same rule the frame contract and the Movable Anchor already
     /// follow, for the same reason.
     id: EntityId,
+    /// Where the body was when the tick began, before the position step.
+    ///
+    /// A collision is a question about the path a body travelled and not about
+    /// where it ended up, so the Thrown matrix needs both ends of it.
+    start: Vec2,
     /// Where the body ended up, after integration and terrain contact.
     pos: Vec2,
     /// The velocity the body began the tick with, until the second pass
@@ -296,6 +301,7 @@ impl World {
             }
             half_step.push(HalfStep {
                 id: body.id,
+                start: body.pos,
                 pos,
                 vel: body.vel,
                 a0,
@@ -719,12 +725,75 @@ impl World {
             if self.bodies[i].kind != BodyKind::Thrown {
                 continue;
             }
+            let Some(step) = self.half_step_of(i).copied() else {
+                continue;
+            };
             // Terrain, the first row: destroyed instantly. Read off the sweep
             // that already resolved this tick's motion rather than tested
             // again, so "struck terrain" means exactly what the integrator
             // means by it, swept and so immune to tunnelling at any speed.
-            if self.half_step_of(i).is_some_and(|s| s.contacts.count > 0) {
+            //
+            // First, and a projectile it destroys ploughs nothing: terrain is
+            // the row that ends the state, and a weapon that met a wall and an
+            // Enemy on the same tick should not collect the reward on its way
+            // out.
+            if step.contacts.count > 0 {
                 self.destroy(i);
+                continue;
+            }
+
+            for j in 0..self.bodies.len() {
+                if self.bodies[i].toughness <= 0.0 {
+                    // Vaporized by an earlier victim in this same tick. A
+                    // destroyed weapon strikes nothing further.
+                    break;
+                }
+                // Only an `Enemy` is a target, which is the same filter
+                // [`World::fire`] uses and holds for the same reason: ADR-0015
+                // takes a Thrown Enemy out of the target set entirely, so two
+                // weapons in flight pass through each other.
+                //
+                // The hero is excluded by that filter, and **that is the
+                // deliberate gap.** ADR-0011 makes a Thrown Enemy striking the
+                // hero destroy the hero outright, and the hero's fail state,
+                // any lose condition, run structure and restart are all
+                // deferred in the map's fog, so there is nothing for the branch
+                // to trigger. The seam is exactly here: a Thrown body whose
+                // swept pass meets the hero is the condition, and what it would
+                // do is the thing nobody has decided yet. Confirmed with the
+                // driving dev on ticket #18.
+                if j == i
+                    || self.bodies[j].kind != BodyKind::Enemy
+                    || self.bodies[j].toughness <= 0.0
+                {
+                    continue;
+                }
+                // Rebuilt per victim from the live projectile, so two strikes
+                // in one tick compound rather than the second overwriting the
+                // first. The motion is the tick's and does not change: one pass
+                // can meet two bodies.
+                let projectile = thrown::Projectile {
+                    start: step.start,
+                    end: self.bodies[i].pos,
+                    vel: self.bodies[i].vel,
+                    mass: self.bodies[i].mass,
+                };
+                let victim = thrown::Victim {
+                    pos: self.bodies[j].pos,
+                    vel: self.bodies[j].vel,
+                    mass: self.bodies[j].mass,
+                };
+                match thrown::plough(&projectile, &victim) {
+                    None => {}
+                    Some(thrown::Plough::Through { vel }) => {
+                        self.destroy(j);
+                        self.bodies[i].vel = vel;
+                    }
+                    Some(thrown::Plough::Mutual) => {
+                        self.destroy(j);
+                        self.destroy(i);
+                    }
+                }
             }
         }
 
@@ -3395,6 +3464,7 @@ mod tests {
     /// at all.
     mod the_thrown_state {
         use super::*;
+        use crate::combat::ENEMY_HALF_EXTENTS;
         use crate::thrown;
 
         /// A hero at the origin and one Enemy `distance` units along the x
@@ -3488,6 +3558,218 @@ mod tests {
         /// `DEFAULT_PULL_STRENGTH * (14 - REST_LENGTH)` is 520, which is a mass
         /// 1 Enemy's tension and half of a mass 2 Enemy's.
         const THROW_DISTANCE: f32 = 14.0;
+
+        /// A hero, a projectile Enemy [`THROW_DISTANCE`] along the x axis, and
+        /// a second Enemy parked far above the scene until a test places it.
+        ///
+        /// No terrain at all, so nothing here can reach the matrix's terrain
+        /// row and the Enemy rows are measured on their own.
+        ///
+        /// The victim starts out of the way and is placed on the flight path
+        /// afterwards, which is not laziness. The pull is always *toward* the
+        /// hero, so an Enemy sitting on the flight path when the tap went out
+        /// would be the nearer target and ADR-0012's arc would Attach to it
+        /// instead: the Tongue would never reach the far Enemy and there would
+        /// be no projectile. Assigning the geometry is the same scaffolding
+        /// `slam_run` uses to assign the hero's momentum rather than earn it,
+        /// and for the same reason.
+        fn firing_line(victim_mass: f32) -> Level {
+            let level = Level {
+                world_bounds: Aabb::new(Vec2::ZERO, Vec2::splat(500.0)),
+                static_terrain: vec![],
+                player_spawn: Vec2::ZERO,
+                enemy_spawns: vec![
+                    EnemySpawn {
+                        pos: Vec2::new(THROW_DISTANCE, 0.0),
+                        toughness: 100_000.0,
+                        mass: 1.0,
+                    },
+                    // Far off the tapped vector: 70 degrees away from it, well
+                    // outside ADR-0012's 10 degree arc, so the tap cannot
+                    // possibly prefer it.
+                    EnemySpawn {
+                        pos: Vec2::new(THROW_DISTANCE, 40.0),
+                        toughness: 100_000.0,
+                        mass: victim_mass,
+                    },
+                ],
+            };
+            level.validate().expect("fixture must be a valid level");
+            level
+        }
+
+        /// The speed a placed projectile is sent into a victim at.
+        ///
+        /// Fast enough that one Sim Tick's motion genuinely crosses the gap
+        /// below, so the strike is a swept contact rather than an overlap that
+        /// happened to be there.
+        const PROJECTILE_SPEED: f32 = 120.0;
+
+        /// Runs `firing_line` up to the tick a Thrown Enemy strikes a victim of
+        /// `victim_mass`, and answers with the world at that point.
+        ///
+        /// `victim_x` is where the victim is placed, so one caller can put it
+        /// in the path and another can leave it out of reach as a control.
+        fn strike(victim_mass: f32, victim_x: f32) -> (World, EntityId, EntityId) {
+            let mut world = World::from_level(&firing_line(victim_mass));
+            let hero = world.hero_id();
+            // By identity and by spawn position rather than by slice order: the
+            // two Enemies are told apart by where the fixture put them.
+            let ids: Vec<(EntityId, Vec2)> = world
+                .snapshot()
+                .bodies
+                .iter()
+                .filter(|b| b.id != hero)
+                .map(|b| (b.id, b.pos))
+                .collect();
+            let projectile = ids
+                .iter()
+                .find(|(_, p)| p.y == 0.0)
+                .expect("the fixture spawns one Enemy on the axis")
+                .0;
+            let victim = ids
+                .iter()
+                .find(|(id, _)| *id != projectile)
+                .expect("the fixture spawns two Enemies")
+                .0;
+
+            tap(&mut world, 1, Vec2::new(THROW_DISTANCE, 0.0));
+            world.step();
+            assert_eq!(
+                kind_of(&world, projectile),
+                Some(BodyKind::Thrown),
+                "the fixture must Throw the projectile before anything is placed"
+            );
+
+            // The projectile is aimed and the victim put in its path. The
+            // Tongue stays Attached throughout, which is what lets the lesser
+            // row's "keeps its own link" clause be asserted at all.
+            world.place(
+                projectile,
+                Vec2::new(THROW_DISTANCE, 0.0),
+                Vec2::new(PROJECTILE_SPEED, 0.0),
+            );
+            world.place(victim, Vec2::new(victim_x, 0.0), Vec2::ZERO);
+            world.step();
+            (world, projectile, victim)
+        }
+
+        /// Where a victim has to sit to be struck inside one tick, and where it
+        /// has to sit to be missed.
+        ///
+        /// One tick at [`PROJECTILE_SPEED`] covers two units, less the Tongue's
+        /// own pull back toward the hero, so a victim two units along is struck
+        /// and one twenty units along is nowhere near.
+        const IN_THE_PATH: f32 = THROW_DISTANCE + 2.0;
+        const OUT_OF_REACH: f32 = THROW_DISTANCE + 20.0;
+
+        #[test]
+        fn a_thrown_enemy_destroys_a_lesser_enemy_and_keeps_its_link_and_its_state() {
+            // ADR-0011's second inverted row, which has four separate clauses
+            // and every one of them is asserted: the target is destroyed, the
+            // projectile keeps its link, it keeps its chain state, and it takes
+            // minor proportional velocity damping.
+            const VICTIM_MASS: f32 = 0.5;
+            let (world, projectile, victim) = strike(VICTIM_MASS, IN_THE_PATH);
+
+            assert_eq!(
+                kind_of(&world, victim),
+                None,
+                "a lesser Enemy struck by a Thrown one must be destroyed"
+            );
+            assert_eq!(
+                kind_of(&world, projectile),
+                Some(BodyKind::Thrown),
+                "the projectile must survive and must still be Thrown: \
+                 it keeps its own chain state"
+            );
+            // Its link: the same slot, still Attached to the same body by
+            // identity. A Tongue that had been re-pointed or dropped would show
+            // up here and nowhere else.
+            assert_eq!(
+                world
+                    .snapshot()
+                    .tongues
+                    .iter()
+                    .map(|t| (t.slot, t.anchor))
+                    .collect::<Vec<_>>(),
+                vec![(0u8, Anchor::Movable(projectile))],
+                "the projectile must keep its own link: {:?}",
+                world.snapshot().tongues
+            );
+
+            // "Minor proportional velocity damping", measured against the
+            // control: the identical scene with the victim left out of reach,
+            // where the only thing acting on the projectile is the Tongue and
+            // gravity. The victim exerts no force on anything, so the two runs
+            // are the same simulation up to the strike and the ratio is the
+            // drag alone.
+            let (control, control_projectile, _) = strike(VICTIM_MASS, OUT_OF_REACH);
+            assert_eq!(
+                kind_of(&control, control_projectile),
+                Some(BodyKind::Thrown),
+                "the control must not strike anything"
+            );
+            let struck = world.body_velocity(projectile).expect("alive");
+            let unstruck = control
+                .body_velocity(control_projectile)
+                .expect("the control projectile must survive");
+            let expected = 1.0 - thrown::PLOUGH_DRAG * VICTIM_MASS / 1.0;
+            for (axis, (a, b)) in [(struck.x, unstruck.x), (struck.y, unstruck.y)]
+                .into_iter()
+                .enumerate()
+            {
+                assert!(
+                    (a - b * expected).abs() <= 1e-5 * b.abs().max(1.0),
+                    "axis {axis}: the strike left {a} where {expected} of the \
+                     unstruck {b} is {}",
+                    b * expected
+                );
+            }
+            // And minor means minor: the weapon keeps most of its speed, or
+            // ploughing would be a cost rather than the reward ADR-0011 makes
+            // it. Both sides of the band, because "lost nothing at all" is as
+            // wrong as "lost everything" and only one of the two is a vacuity
+            // guard.
+            let kept = struck.length() / unstruck.length();
+            assert!(
+                (0.8..1.0).contains(&kept),
+                "the projectile kept {kept} of its speed, outside the minor band"
+            );
+        }
+
+        #[test]
+        fn a_thrown_enemy_and_an_equal_weight_class_destroy_each_other_and_free_the_slot() {
+            // ADR-0011's third inverted row: mutual destruction, both
+            // vaporized, the player's Anchor slot freed. The mutation of the
+            // test above, and the only thing that differs between the two
+            // scenes is the victim's mass.
+            let (world, projectile, victim) = strike(1.0, IN_THE_PATH);
+
+            assert_eq!(
+                kind_of(&world, victim),
+                None,
+                "the target must be vaporized"
+            );
+            assert_eq!(
+                kind_of(&world, projectile),
+                None,
+                "an equal weight class must take the projectile with it"
+            );
+            assert!(
+                world.snapshot().tongues.is_empty(),
+                "mutual destruction must free the player's Anchor slot: {:?}",
+                world.snapshot().tongues
+            );
+            // The hero keeps exactly the momentum it had. ADR-0014 makes this a
+            // Release and ADR-0012 makes a Release cost nothing, so losing a
+            // weapon must not also shove the hero.
+            let hero = world.hero_id();
+            assert!(
+                world.body_velocity(hero).expect("hero").x > 0.0,
+                "the hero must still be carrying its own pull"
+            );
+        }
 
         #[test]
         fn a_thrown_enemy_in_contact_with_terrain_is_destroyed() {

@@ -48,6 +48,17 @@ use glam::Vec2;
 /// so the threshold is reachable without the clamp being involved at all.
 pub const THROW_TENSION: f32 = 500.0;
 
+/// A compile-time guard on the paragraph above: the threshold has to be
+/// reachable without the per-Tongue clamp being involved.
+///
+/// A `const` assertion rather than a test, because it is a relation between two
+/// constants and nothing a simulation could run would make it more true. Raise
+/// either constant past the other and this fails to build, which is the right
+/// moment to notice: a threshold above the ceiling would make the Thrown state
+/// unreachable for a mass 1 Enemy on one Tongue, and nothing else in the suite
+/// would say so.
+const _: () = assert!(THROW_TENSION < crate::DEFAULT_FORCE_CEILING);
+
 /// The tension one Tongue force puts on a body of `mass`.
 ///
 /// Force per unit mass, which is the body's own acceleration from the Tongue.
@@ -208,5 +219,197 @@ pub fn plough(projectile: &Projectile, victim: &Victim) -> Option<Plough> {
             vel: projectile.vel * (1.0 - PLOUGH_DRAG * victim.mass / projectile.mass),
         }),
         WeightClass::Equal => Some(Plough::Mutual),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DEFAULT_PULL_STRENGTH, REST_LENGTH};
+
+    /// A projectile crossing the origin from the left, fast enough that one
+    /// tick's motion carries it clean through a box sitting there.
+    fn projectile(mass: f32) -> Projectile {
+        Projectile {
+            start: Vec2::new(-2.0, 0.0),
+            end: Vec2::new(2.0, 0.0),
+            vel: Vec2::new(240.0, 0.0),
+            mass,
+        }
+    }
+
+    /// A victim at the origin, in the path of [`projectile`].
+    fn victim(mass: f32) -> Victim {
+        Victim {
+            pos: Vec2::ZERO,
+            vel: Vec2::ZERO,
+            mass,
+        }
+    }
+
+    #[test]
+    fn the_tension_is_a_force_over_a_mass_so_a_heavier_enemy_resists() {
+        // ADR-0011 derives the tension from the hero's `pull_strength`, the
+        // relative velocities, and the mass differential. The first two are the
+        // Tongue's own force law; this is the third, and without it a heavy
+        // Enemy would be exactly as easy to Throw as a light one.
+        let force = Vec2::new(0.0, THROW_TENSION);
+        assert!(
+            exceeds_tension(force, 1.0),
+            "a force equal to the threshold must Throw a unit mass"
+        );
+        assert!(
+            !exceeds_tension(force, 2.0),
+            "twice the mass must halve the tension and stay below the threshold"
+        );
+        // The direction is irrelevant: a yank sideways is as much a yank as one
+        // along an axis, so the magnitude is what counts.
+        let diagonal = Vec2::splat(THROW_TENSION / 2.0f32.sqrt());
+        assert!(
+            (tension(diagonal, 1.0) - THROW_TENSION).abs() < 1e-3,
+            "a diagonal force of the same magnitude read {}",
+            tension(diagonal, 1.0)
+        );
+    }
+
+    #[test]
+    fn the_threshold_is_reachable_by_a_loaded_stretch_and_not_by_an_ordinary_attach() {
+        // The one gameplay claim the constant makes, and it is checkable rather
+        // than rhetorical. ADR-0011 gives the tracking band rules of its own,
+        // so a threshold an ordinary Attach cleared would delete that band, and
+        // one nothing could reach would delete the Thrown state instead.
+        //
+        // Both ends are pure Hooke's law at rest, where the damping term is
+        // identically zero, so these are exact rather than measured.
+        let tension_at = |length: f32, mass: f32| {
+            tension(
+                Vec2::new(DEFAULT_PULL_STRENGTH * (length - REST_LENGTH), 0.0),
+                mass,
+            )
+        };
+        assert!(
+            tension_at(8.0, 1.0) < THROW_TENSION,
+            "an eight unit Attach on a baseline Enemy must merely track it, got {}",
+            tension_at(8.0, 1.0)
+        );
+        assert!(
+            tension_at(20.0, 1.0) >= THROW_TENSION,
+            "a twenty unit loaded Stretch must Throw a baseline Enemy, got {}",
+            tension_at(20.0, 1.0)
+        );
+        // And a light Enemy goes at a touch, which is the mass differential
+        // being the mechanic rather than a correction.
+        assert!(
+            tension_at(4.0, 0.2) >= THROW_TENSION,
+            "a quarter-weight Enemy must Throw at close range, got {}",
+            tension_at(4.0, 0.2)
+        );
+    }
+
+    #[test]
+    fn a_non_positive_mass_reads_no_tension_rather_than_an_infinite_one() {
+        // Hostile input. `Level::validate` rejects a non-positive mass, so this
+        // is unreachable from level data, but a division that answered infinity
+        // would Throw a body that cannot exist, and the answer would arrive as
+        // `true` rather than as a panic.
+        assert_eq!(tension(Vec2::new(1.0, 0.0), 0.0), 0.0);
+        assert!(!exceeds_tension(Vec2::new(1e30, 0.0), 0.0));
+    }
+
+    #[test]
+    fn the_weight_class_band_separates_lesser_from_equal_and_folds_heavier_in() {
+        assert_eq!(weight_class(1.0, 0.5), WeightClass::Lesser);
+        // Identical masses are the row that matters, because `from_ascii` and
+        // the shipped scene both author Enemies at one mass: two of them must
+        // be an equal fight and not a coin toss on a last bit.
+        assert_eq!(weight_class(1.0, 1.0), WeightClass::Equal);
+        assert_eq!(
+            weight_class(1.0, 1.0 - WEIGHT_CLASS_BAND * 0.5),
+            WeightClass::Equal
+        );
+        assert_eq!(
+            weight_class(1.0, 1.0 - WEIGHT_CLASS_BAND * 2.0),
+            WeightClass::Lesser
+        );
+        // Heavier folds into the equal row rather than becoming a fourth one.
+        // ADR-0015 records why: the matrix has three rows, and the risk of
+        // using a weapon must not fall as the target gets heavier.
+        assert_eq!(weight_class(1.0, 50.0), WeightClass::Equal);
+        // Scale-free, so the band is a weight class and not an absolute mass.
+        assert_eq!(weight_class(10.0, 5.0), WeightClass::Lesser);
+        assert_eq!(weight_class(0.1, 0.05), WeightClass::Lesser);
+    }
+
+    #[test]
+    fn a_pass_that_meets_nothing_resolves_nothing() {
+        let mut aside = victim(0.1);
+        aside.pos = Vec2::new(0.0, 10.0);
+        assert_eq!(plough(&projectile(1.0), &aside), None);
+    }
+
+    #[test]
+    fn a_target_already_separating_is_not_struck() {
+        // Hostile input, and the same guard `combat::resolve_contact` keeps:
+        // the closing speed is signed rather than taken as an absolute value. A
+        // projectile leaving a body it has just passed is not striking it
+        // again, and without the sign the mutual row would vaporize a weapon
+        // for flying away from something.
+        let mut fleeing = victim(1.0);
+        // Running away faster than the projectile is chasing.
+        fleeing.vel = Vec2::new(500.0, 0.0);
+        assert_eq!(plough(&projectile(1.0), &fleeing), None);
+
+        // Mutation check: the same geometry with the target standing still is
+        // struck, so the test above is not passing because the paths missed.
+        assert_eq!(plough(&projectile(1.0), &victim(1.0)), Some(Plough::Mutual));
+    }
+
+    #[test]
+    fn ploughing_a_lesser_enemy_shortens_the_projectiles_velocity_without_turning_it() {
+        let shot = projectile(1.0);
+        let Some(Plough::Through { vel }) = plough(&shot, &victim(0.25)) else {
+            panic!("a quarter-weight target must be the lesser row");
+        };
+        // Direction preserved exactly. Subtracting along the contact normal
+        // instead would turn the weapon, and a weapon that changed direction on
+        // every body it passed through could not be aimed.
+        assert_eq!(
+            vel.normalize().to_array(),
+            shot.vel.normalize().to_array(),
+            "the drag turned the projectile"
+        );
+        let expected = 1.0 - PLOUGH_DRAG * 0.25;
+        assert!(
+            (vel.length() / shot.vel.length() - expected).abs() < 1e-6,
+            "kept {} of its speed against the analytic {expected}",
+            vel.length() / shot.vel.length()
+        );
+        // Proportional to the target's weight: half the target, half the cost.
+        let Some(Plough::Through { vel: lighter }) = plough(&shot, &victim(0.125)) else {
+            panic!("an eighth-weight target must be the lesser row");
+        };
+        let lost = |v: Vec2| 1.0 - v.length() / shot.vel.length();
+        assert!(
+            (lost(vel) / lost(lighter) - 2.0).abs() < 1e-3,
+            "halving the target's mass changed the cost by {}x and not 2x",
+            lost(vel) / lost(lighter)
+        );
+    }
+
+    #[test]
+    fn the_whole_lesser_row_leaves_a_weapon_worth_using() {
+        // The ADR calls the damping "minor", and the sharpest way to say what
+        // that means is over the entire row: the heaviest target that can reach
+        // it at all must still leave the projectile most of its speed.
+        let shot = projectile(1.0);
+        let worst = victim(1.0 - WEIGHT_CLASS_BAND - 1e-4);
+        let Some(Plough::Through { vel }) = plough(&shot, &worst) else {
+            panic!("the heaviest lesser target must still be the lesser row");
+        };
+        assert!(
+            vel.length() / shot.vel.length() > 0.8,
+            "the worst case left only {} of the speed",
+            vel.length() / shot.vel.length()
+        );
     }
 }
