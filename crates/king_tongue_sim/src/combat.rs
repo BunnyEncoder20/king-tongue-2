@@ -31,8 +31,9 @@ pub const ENEMY_HALF_EXTENTS: Vec2 = Vec2::splat(0.5);
 /// anything under two units per second of closing speed a recoverable bump.
 pub const KICK_THRESHOLD: f32 = 2.0;
 
-/// The `Toughness` one Kick spends. Fixed and minimal, per ADR-0011: a Kick is
-/// a recoverable mistake, not a chip strategy.
+/// The `Toughness` one Kick spends when the pool can afford it. Fixed and
+/// minimal, per ADR-0011: a Kick is a recoverable mistake, not a chip strategy.
+/// What a Kick actually takes is [`kick_spend`], which can never empty a pool.
 pub const KICK_DAMAGE: f32 = 1.0;
 
 /// Fraction of its approach speed a Kick returns to the hero. One is fully
@@ -231,7 +232,7 @@ pub fn resolve_contact(hero: &HeroPass, enemy: &EnemyTarget) -> Resolution {
             toughness: if enemy.spent {
                 enemy.toughness
             } else {
-                enemy.toughness - KICK_DAMAGE
+                enemy.toughness - kick_spend(enemy.toughness)
             },
             spent: true,
             band: Some(ImpactBand::Kick),
@@ -280,6 +281,39 @@ pub fn momentum_drain(momentum: Vec2, toughness_spent: f32) -> Vec2 {
     }
     let fraction = (toughness_spent / incoming).clamp(0.0, MAX_DRAIN_FRACTION);
     momentum * fraction
+}
+
+/// What one Kick takes from a pool of `toughness`.
+///
+/// [`KICK_DAMAGE`] when the pool can afford it, and nothing at all when it
+/// cannot. **A Kick can therefore never destroy an Enemy**, which is the rule
+/// and not a side effect: ADR-0011 makes a Kick "a recoverable mistake, not a
+/// chip strategy", and an Enemy that a below-threshold bump finished off is the
+/// opposite of both halves of that. The kill would also be invisible to the
+/// Combo, which counts Slams and a Kick is the band that explicitly is not one.
+///
+/// **A runtime invariant on the spend, because a load-time check cannot be
+/// one.** `Level::validate` rejects an authored `toughness` at or below
+/// `KICK_DAMAGE` and still does, as an author-time error message that names the
+/// offending Enemy; it is no longer what enforces the rule, because it sees the
+/// authored figure and the pool changes after load. An Enemy authored at 3.0
+/// passes it, takes a Slam of 2.5, survives at 0.5, and was then destroyed by
+/// one Kick.
+///
+/// Nothing rather than a part of the pool, because every other answer needs a
+/// floor nobody has decided: destruction is `toughness > 0.0` and nothing else,
+/// so stopping exactly short of zero would mean inventing an epsilon, and
+/// leaving the pool at zero is destruction. Declining the spend reuses the
+/// comparison `Level::validate` already makes, so the runtime rule and the
+/// author-time message cannot drift apart. The elastic repel is untouched: it
+/// is a per-tick contact response and not the spend, so a Kick against a nearly
+/// empty pool still pushes the two bodies apart.
+pub fn kick_spend(toughness: f32) -> f32 {
+    if toughness > KICK_DAMAGE {
+        KICK_DAMAGE
+    } else {
+        0.0
+    }
 }
 
 /// The elastic repel of a Kick: a restitution impulse along the normal that
@@ -657,6 +691,62 @@ mod tests {
             (out.hero_vel.x - -1.0).abs() < 0.01,
             "expected a near full reflection, got {out:?}"
         );
+    }
+
+    #[test]
+    fn a_kick_cannot_destroy_an_enemy_a_slam_has_already_chipped() {
+        // ADR-0011 makes a Kick "a recoverable mistake, not a chip strategy",
+        // so a Kick must never be the thing that destroys an Enemy. The
+        // load-time guard in `Level::validate` cannot defend that, because it
+        // sees the authored figure and the pool changes after load.
+        //
+        // The route the guard misses, in full: an Enemy authored at 3.0, which
+        // the guard accepts because 3.0 is above KICK_DAMAGE, takes a Slam of
+        // 2.5 and survives at 0.5. One below-threshold Kick then spent 1.0, the
+        // pool went to -0.5, and `World`'s single `retain(|b| b.toughness >
+        // 0.0)` destroyed it. The kill was invisible to the Combo as well,
+        // since a Kick is not counted as a Slam.
+        let chipping = pass(
+            Vec2::new(-2.0, 0.0),
+            Vec2::new(-0.5, 0.0),
+            Vec2::new(2.5, 0.0),
+        );
+        let chipped = resolve_contact(&chipping, &enemy(3.0));
+        assert_eq!(chipped.band, Some(ImpactBand::Slam), "{chipped:?}");
+        assert!(
+            (chipped.toughness - 0.5).abs() < 1e-4,
+            "the fixture must leave a pool below KICK_DAMAGE: {chipped:?}"
+        );
+        assert!(!chipped.destroyed(), "{chipped:?}");
+
+        // A fresh contact: the hero left and drifted back in under the
+        // threshold.
+        let drift = pass(
+            Vec2::new(-1.2, 0.0),
+            Vec2::new(-0.9, 0.0),
+            Vec2::new(1.0, 0.0),
+        );
+        let out = resolve_contact(&drift, &enemy(chipped.toughness));
+        assert_eq!(out.band, Some(ImpactBand::Kick), "{out:?}");
+        assert!(!out.destroyed(), "a Kick must never destroy: {out:?}");
+        // And the repel still happens, because it is a per-tick contact
+        // response and not the spend: a Kick that stopped pushing would let the
+        // hero sink through an Enemy it cannot hurt.
+        assert!(
+            out.enemy_vel.x > 0.0 && out.hero_vel.x < drift.vel.x,
+            "the elastic repel must survive the floored spend: {out:?}"
+        );
+
+        // Across every pool a Kick can meet, and not just the one above. Each
+        // of these is reachable, because a Slam can leave any remainder.
+        for remaining in [1e-6, 0.01, 0.25, 0.5, 0.99, KICK_DAMAGE] {
+            let out = resolve_contact(&drift, &enemy(remaining));
+            assert_eq!(out.band, Some(ImpactBand::Kick), "{out:?}");
+            assert!(
+                !out.destroyed(),
+                "a Kick destroyed a pool of {remaining}: {out:?}"
+            );
+        }
     }
 
     #[test]

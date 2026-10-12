@@ -45,6 +45,16 @@ Each Enemy carries a single `toughness`, in momentum units. The impact's normal 
 
 One concept rather than two. A separate hit-point notion was rejected: it would need its own units, its own tuning, and a conversion to momentum at every impact. A pure threshold model with no pool was also rejected, because it locks a light hero out of ever harming a heavy Enemy; the pool lets a weak hero chip a heavy one over several passes.
 
+### A Kick can never destroy an Enemy, and that is enforced on the spend
+
+The Kick row is "fixed minimal damage", and the band exists because a Kick is a recoverable mistake and not a chip strategy. An Enemy that a below-threshold bump finished off contradicts both halves of that, so **a Kick takes `KICK_DAMAGE` when the remaining pool can afford it and nothing at all when it cannot**. The rule is ADR-derived rather than invented combat math: it is what this section already says about the band, stated in a form the code can hold.
+
+**It has to be a runtime invariant on the spend, because load-time validation cannot be one.** Ticket #15 put a guard in `Level::validate` rejecting an authored `toughness` at or below `KICK_DAMAGE`, and explicitly rejected flooring the Kick. That was wrong, and the chipped pool is why: the guard sees the authored figure and the pool changes after load. An Enemy authored at 3.0 passes it, takes a Slam of 2.5 normal momentum, survives at 0.5 in the Slam band, and one Kick then spent 1.0, took the pool to -0.5, and the single `retain(|b| b.toughness > 0.0)` destroyed it. The kill was invisible to the Combo as well, since a Kick is the band that is explicitly not a Slam.
+
+Nothing rather than a part of the pool, because every other answer needs a floor nobody has decided. Destruction is an emptied pool and nothing else, so stopping just short of zero would mean inventing an epsilon, and leaving the pool at zero is destruction. `Level::validate`'s guard is kept as an author-time error message that names the Enemy whose authored figure makes no sense, which a silent runtime floor does not, and it makes the same comparison so the two cannot drift apart. The elastic repel is untouched, because it is a per-tick contact response and not the spend: a Kick against a nearly empty pool still pushes the two bodies apart.
+
+Recorded while fixing Phase 5's review findings.
+
 ## Momentum drain is proportional, capped, and eventually zero
 
 The player loses momentum in proportion to the `toughness` actually consumed, clamped so one impact can never drain more than 50 percent of the incoming momentum vector. Above a high momentum ceiling the drain is zero: direction and speed are preserved and the hero passes straight through Enemies.

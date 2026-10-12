@@ -165,22 +165,28 @@ impl Level {
             if s.toughness <= 0.0 {
                 return Err(LevelError::Invalid("enemy toughness must be positive"));
             }
-            // A Kick must not be able to kill. Ticket #15 and ADR-0011 give a
-            // Kick fixed minimal damage because it is "a recoverable mistake
-            // rather than a death", but nothing downstream makes that true:
-            // `World` destroys on an emptied pool with one rule for every band,
-            // so an Enemy authored at or below [`crate::combat::KICK_DAMAGE`]
-            // dies to a single below-threshold bump. That kill would also be
-            // invisible to the Combo, which counts Slams and not Kicks.
+            // A Kick must not be able to kill. ADR-0011 gives a Kick fixed
+            // minimal damage because it is "a recoverable mistake, not a chip
+            // strategy", and `World` destroys on an emptied pool with one rule
+            // for every band, so an Enemy authored at or below
+            // [`crate::combat::KICK_DAMAGE`] would die to a single
+            // below-threshold bump.
             //
-            // Caught here rather than by flooring the Kick's damage in
-            // `combat`, which would invent combat math: this is the last place
-            // that sees the authored figure, and rejecting the level says
-            // exactly which Enemy is wrong instead of silently changing what a
-            // Kick does to every Enemy.
+            // **This is no longer what enforces that rule.**
+            // [`crate::combat::kick_spend`] is, as a runtime invariant on the
+            // spend, and it has to be: load-time validation cannot defend a
+            // value that changes after load, and an Enemy authored at 3.0
+            // passes this check, takes a Slam of 2.5, survives at 0.5, and was
+            // then destroyed by one Kick. Ticket #15 rejected flooring the Kick
+            // as inventing combat math and directed this guard instead; the
+            // chipped pool is why that was wrong.
             //
-            // The comparison includes the threshold: spending exactly the pool
-            // leaves zero, and zero is destroyed.
+            // Kept anyway, and worth keeping: it is an author-time error
+            // message that names the Enemy whose authored figure makes no
+            // sense, which a silent runtime floor does not. Same comparison as
+            // `kick_spend`, so the two cannot drift apart, and it includes the
+            // threshold because spending exactly the pool leaves zero and zero
+            // is destroyed.
             if s.toughness <= crate::combat::KICK_DAMAGE {
                 return Err(LevelError::Invalid(
                     "enemy toughness must exceed the Kick damage, or one \
