@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod combat;
+pub mod combo;
 pub mod despawn;
 /// The determinism harness. Behind `test-util`, like `Level::from_ascii`, so it
 /// cannot reach a build that ships.
@@ -22,6 +23,7 @@ pub mod level;
 pub mod tongue;
 pub mod world;
 
+pub use combo::Combo;
 pub use frame::{Accumulator, Body, BodyKind, Snapshot, TongueLine, MAX_CATCHUP_TICKS};
 pub use input::{GestureTracker, TouchPhase, TouchSample};
 pub use level::{Aabb, EnemySpawn, Level, LevelError};
