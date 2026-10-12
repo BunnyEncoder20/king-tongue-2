@@ -1808,6 +1808,151 @@ mod tests {
         );
     }
 
+    /// The stiffest spring any single body feels in `trace`, and the lightest
+    /// body in the scene it feels it on.
+    ///
+    /// Both halves are needed because ADR-0007's bound is `4 * mass / DT^2`:
+    /// a given `pull_strength` is further from the cliff on a heavier body, so
+    /// the honest ratio is the stiffest spring over the bound at the *lightest*
+    /// mass present.
+    ///
+    /// Counted out of the `Snapshot` rather than read from inside the `World`,
+    /// which is the seam the spec allows and is also the more useful place to
+    /// count: `World::pulls_on` gives the hero one pull per Attached slot and a
+    /// Movable Anchor the reaction for every slot Attached to it, and a
+    /// `Snapshot`'s Tongue list says exactly that.
+    fn stiffest_spring(level: &Level, trace: &[Snapshot]) -> (f32, f32) {
+        let hero = World::from_level(level).hero_id();
+        let k = World::from_level(level).hero_pull_strength();
+        let lightest = level
+            .enemy_spawns
+            .iter()
+            .map(|s| s.mass)
+            .fold(crate::DEFAULT_PLAYER_MASS, f32::min);
+        let mut most = 0usize;
+        for snapshot in trace {
+            for body in &snapshot.bodies {
+                let pulls = if body.id == hero {
+                    snapshot.tongues.len()
+                } else {
+                    snapshot
+                        .tongues
+                        .iter()
+                        .filter(|t| t.anchor == Anchor::Movable(body.id))
+                        .count()
+                };
+                most = most.max(pulls);
+            }
+        }
+        (most as f32 * k, lightest)
+    }
+
+    #[test]
+    fn no_mechanic_drives_pull_strength_near_the_verlet_bound() {
+        // ADR-0007 is explicit that a `pull_strength` approaching `4 * mass /
+        // DT^2` reopens ADR-0002 rather than ADR-0007, which makes this a
+        // guard on an architectural decision rather than a unit test: the day
+        // this fails, the fixed Sim Tick is what has to be revisited, and the
+        // only way to find that out early is to measure it over every mechanic
+        // the game has.
+        //
+        // The quantity swept is the stiffness a single body actually feels,
+        // which is not the same number as the hero's `pull_strength`. ADR-0003
+        // sums two Tongues as vectors, and ADR-0006 allows two on one Anchor,
+        // so a body held by both slots feels twice the constant against its own
+        // mass; and a Movable Anchor feels the hero's `k` rather than one of
+        // its own, so a light Enemy is the worst case rather than the hero.
+        let mut worst = 0.0f32;
+        let mut observed = 0.0f32;
+        for run in runs() {
+            let trace = record(&run.level, run.ticks, run.script);
+            let (stiffest, lightest) = stiffest_spring(&run.level, &trace);
+            let bound = crate::max_stable_pull_strength(lightest);
+            let ratio = stiffest / bound;
+            assert!(
+                ratio < 0.01,
+                "{}: a body felt a spring of {stiffest} against a bound of \
+                 {bound} at mass {lightest}, which is {ratio} of the way to the \
+                 cliff. ADR-0007 says this reopens ADR-0002.",
+                run.name
+            );
+            worst = worst.max(ratio);
+            observed = observed.max(stiffest);
+        }
+
+        // And the sweep really saw the worst case the game can produce, rather
+        // than reporting a comfortable zero because no Tongue ever Attached.
+        // Two slots at the baseline constant is the most any body can feel:
+        // ADR-0006 caps the hero at `MAX_TONGUES`, both ends of a Tongue use
+        // the hero's `k`, and nothing outside test scaffolding changes it.
+        assert_eq!(
+            observed,
+            crate::MAX_TONGUES as f32 * crate::DEFAULT_PULL_STRENGTH,
+            "the sweep never saw two Tongues on one body, so its worst case is \
+             not the game's"
+        );
+        // 80 against 14,400 is 0.56 percent, so the finding is two orders of
+        // magnitude of headroom and not a near miss.
+        assert!(
+            worst < 0.006,
+            "the worst ratio across every scripted run was {worst}"
+        );
+    }
+
+    #[test]
+    fn the_world_stays_stable_across_a_sweep_of_pull_strength() {
+        // The other half of a sweep: not only is the shipped constant far from
+        // the cliff, the whole system is stable across the range a device
+        // tuning pass might reach for. `set_hero_pull_strength` is the only
+        // knob that exists, and ADR-0003 calls the shipped 40 a starting point
+        // for tuning rather than a final value, so the question "how far can
+        // this be turned up before something breaks" has to have an answer
+        // before somebody turns it up on a phone.
+        //
+        // A hundred times the baseline is still 2.8 percent of the bound.
+        for k in [crate::DEFAULT_PULL_STRENGTH, 100.0, 400.0, 1_200.0, 4_000.0] {
+            let level = everything_scene();
+            let mut world = World::from_level(&level);
+            world.set_hero_pull_strength(k);
+            let mut fastest = 0.0f32;
+            for _ in 0..MINUTE {
+                every_mechanic(world.snapshot().tick, &mut world);
+                world.step();
+                for body in &world.snapshot().bodies {
+                    assert!(
+                        body.pos.is_finite(),
+                        "at pull_strength {k}, {body:?} left the number line on \
+                         tick {}",
+                        world.snapshot().tick
+                    );
+                    let speed = world
+                        .body_velocity(body.id)
+                        .map(|v| v.length())
+                        .unwrap_or_default();
+                    assert!(
+                        speed.is_finite(),
+                        "at pull_strength {k}, a speed went \
+                        non-finite on tick {}",
+                        world.snapshot().tick
+                    );
+                    fastest = fastest.max(speed);
+                }
+            }
+            // Measured peaks: 92 units per second at the baseline, 108 at a
+            // hundred, and 210 to 220 across the rest, which flattens because
+            // ADR-0003's force ceiling of 1200 binds long before the spring
+            // constant does. That flattening is the useful finding: past a few
+            // hundred, turning `pull_strength` up barely changes what the hero
+            // can reach, so a tuning pass has no reason to go anywhere near
+            // the cliff. A thousand is what this is allowed; divergence does
+            // not land near a bound like that, it reaches 1e20 inside a second.
+            assert!(
+                fastest < 1_000.0,
+                "at pull_strength {k} something reached {fastest} units per second"
+            );
+        }
+    }
+
     #[test]
     fn the_encoding_notices_a_divergence_a_decimal_rendering_would_hide() {
         // A comparison that cannot fail is worse than no comparison. Two
