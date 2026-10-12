@@ -2203,6 +2203,107 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_from_suspend_runs_the_clamped_tick_count_and_leaves_the_next_frame_normal() {
+        // `Accumulator` has a unit test for a three minute suspend, and this is
+        // the same claim through the whole system: a `World` driven by frame
+        // times the way the Shell drives it, with every mechanic live, and the
+        // suspend landing in the middle of a Swing rather than on an idle
+        // scene.
+        //
+        // What the AC asks for is two separate things, and the second is the
+        // one a unit test on the clock cannot reach. A suspend must cost
+        // *simulated time* and nothing else: the tick sequence either side of
+        // it has to be the sequence the run would have had anyway, because the
+        // only thing a dropped tick may change is how far behind the wall
+        // clock the simulation is. If a stall could perturb the state, then
+        // ADR-0002's clamp would have traded a frame-rate spiral for a
+        // difficulty that depends on how often the player gets a phone call.
+        use crate::{Accumulator, DT, MAX_CATCHUP_TICKS};
+
+        let level = everything_scene();
+        let mut world = World::from_level(&level);
+        let mut accumulator = Accumulator::new();
+        let mut trace = vec![world.snapshot().clone()];
+
+        // Frame times as a device would report them: ordinary frames, a stall
+        // worth a few ticks, the suspend, more ordinary frames, and the
+        // hostile readings the Accumulator refuses outright mixed in so that a
+        // refusal mid-run cannot shift anything either.
+        let mut frames: Vec<f32> = Vec::new();
+        frames.extend(core::iter::repeat_n(DT, 200));
+        frames.push(DT * 2.5);
+        frames.extend(core::iter::repeat_n(DT, 50));
+        // The suspend. Three minutes backgrounded is what ADR-0002 names, and
+        // Macroquad computes frame delta inside `draw()`, which is skipped
+        // while suspended, so the first post-resume delta is the whole of it.
+        frames.push(180.0);
+        frames.push(f32::NAN);
+        frames.push(-1.0);
+        frames.push(0.0);
+        frames.extend(core::iter::repeat_n(DT, 400));
+        // And a second, far worse one, which is where this test found a defect
+        // rather than confirming one: before the fix in `Accumulator::feed`, a
+        // delta this large left the debt non-finite and every frame after it
+        // ran zero ticks, so the hero below simply stopped moving for the rest
+        // of the run.
+        frames.push(f32::MAX);
+        frames.extend(core::iter::repeat_n(DT, 400));
+
+        let mut after_the_suspend = None;
+        for (frame, delta) in frames.iter().copied().enumerate() {
+            let ticks = accumulator.feed(delta);
+            assert!(
+                ticks <= MAX_CATCHUP_TICKS,
+                "frame {frame} of {delta:e} ran {ticks} ticks, over ADR-0002's clamp"
+            );
+            if delta >= 180.0 {
+                assert_eq!(
+                    ticks, MAX_CATCHUP_TICKS,
+                    "a suspend must run the clamped count"
+                );
+                after_the_suspend = Some(frame + 1);
+            }
+            let alpha = accumulator.alpha();
+            assert!(
+                alpha.is_finite() && (0.0..=1.0).contains(&alpha),
+                "frame {frame} of {delta:e} left alpha at {alpha}"
+            );
+            for _ in 0..ticks {
+                every_mechanic(world.snapshot().tick, &mut world);
+                world.step();
+                trace.push(world.snapshot().clone());
+            }
+        }
+        assert!(
+            after_the_suspend.is_some(),
+            "the suspend must be in the run"
+        );
+        assert!(
+            accumulator.dropped_ticks > 10_000,
+            "most of a three minute debt must have been dropped, dropped {}",
+            accumulator.dropped_ticks
+        );
+
+        // Every tick the stalled run did simulate is bit-identical to the tick
+        // the unstalled run simulated in its place. The suspend cost simulated
+        // time and changed nothing else.
+        let straight = record(&level, trace.len() as u32 - 1, every_mechanic);
+        if let Some(where_) = first_divergence(&straight, &trace) {
+            panic!("a suspend changed the tick sequence: {where_}");
+        }
+
+        // The run really is long enough for that to mean something, and really
+        // did fall behind. The frame list asks for a little over twelve
+        // thousand ticks, most of it the suspend's 10,800; the clamp runs 1,062
+        // of them and drops the rest, which is ADR-0002's trade in one number.
+        assert!(
+            trace.len() > 1_000,
+            "the stalled run only reached tick {}",
+            trace.len() - 1
+        );
+    }
+
+    #[test]
     fn the_encoding_notices_a_divergence_a_decimal_rendering_would_hide() {
         // A comparison that cannot fail is worse than no comparison. Two
         // snapshots one bit apart in one coordinate must be reported, which is

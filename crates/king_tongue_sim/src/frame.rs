@@ -58,9 +58,26 @@ impl Accumulator {
         if self.debt >= DT {
             // Over the ceiling. Keep only the sub-tick remainder so `alpha` stays
             // smooth, and account for what was thrown away.
+            //
+            // The remainder is taken with `%` rather than by subtracting
+            // `(debt / DT).floor() * DT`, and the counter saturates rather than
+            // adding, because both of those were defects a large enough delta
+            // reached. A frame time of `f32::MAX` makes `debt / DT` overflow to
+            // infinity, so the subtraction left `debt` at negative infinity and
+            // `feed` then returned zero ticks for the rest of the run: the
+            // simulation froze permanently and no later frame could restart it.
+            // Fixing that made the counter's overflow reachable in turn, since
+            // `inf as u64` saturates to `u64::MAX` and the next such frame
+            // added to it. `%` is exact at every magnitude and cannot leave the
+            // debt outside `0.0..DT`.
+            //
+            // Such a delta is not reachable from a sane clock, which is exactly
+            // what was said about the negative one this function already
+            // refuses. Guarding the input and letting the state go non-finite
+            // is half a guard.
             let discarded = (self.debt / DT).floor();
-            self.dropped_ticks += discarded as u64;
-            self.debt -= discarded * DT;
+            self.dropped_ticks = self.dropped_ticks.saturating_add(discarded as u64);
+            self.debt %= DT;
         }
 
         ticks
@@ -298,6 +315,58 @@ mod tests {
         assert_eq!(acc.feed(f32::NAN), 0);
         assert_eq!(acc.feed(0.0), 0);
         assert!(acc.alpha().is_finite());
+    }
+
+    #[test]
+    fn an_enormous_frame_delta_does_not_freeze_the_simulation_forever() {
+        // The regression this prevents froze the game permanently, and nothing
+        // caught it because every test fed a plausible number. A three minute
+        // suspend is 180 seconds and the test above it covers that; a clock
+        // that reports a very large delta instead used to leave the debt at
+        // negative infinity, because `(debt / DT).floor()` overflowed and the
+        // subtraction that followed had nothing finite to subtract. From that
+        // point `feed` returned zero ticks for every frame for the rest of the
+        // run. The AC this belongs to asks that the frame *after* an enormous
+        // one be normal, and for a large enough delta it never was again.
+        //
+        // The deltas below are not reachable from a working clock, which is
+        // precisely what is true of the negative delta this type already
+        // refuses on the grounds that clocks do go backwards. Validating the
+        // input and letting the state go non-finite is half a guard.
+        for delta in [180.0, 1e6, 1e20, 1e30, f32::MAX] {
+            let mut acc = Accumulator::new();
+            assert_eq!(
+                acc.feed(delta),
+                MAX_CATCHUP_TICKS,
+                "a delta of {delta:e} must run the clamped count and no more"
+            );
+            let alpha = acc.alpha();
+            assert!(
+                alpha.is_finite() && (0.0..=1.0).contains(&alpha),
+                "a delta of {delta:e} left alpha at {alpha}"
+            );
+            // The frame after it is an ordinary frame, which is the whole
+            // claim: one stalled frame costs simulated time and nothing else.
+            assert_eq!(
+                acc.feed(DT),
+                1,
+                "the frame after a delta of {delta:e} was not normal"
+            );
+            assert_eq!(acc.feed(DT), 1);
+            assert_eq!(acc.feed(DT * 3.0), 3);
+        }
+
+        // And it survives being fed the worst case repeatedly, which is the
+        // defect the fix above uncovered rather than introduced: the dropped
+        // count saturates at `u64::MAX`, and adding to it again overflowed.
+        // Unreachable while the debt was poisoned, because the poisoned debt
+        // never reached the counter a second time.
+        let mut acc = Accumulator::new();
+        for _ in 0..4 {
+            assert_eq!(acc.feed(f32::MAX), MAX_CATCHUP_TICKS);
+        }
+        assert_eq!(acc.dropped_ticks, u64::MAX, "the count must saturate");
+        assert_eq!(acc.feed(DT), 1, "and the clock must still work afterwards");
     }
 
     #[test]
