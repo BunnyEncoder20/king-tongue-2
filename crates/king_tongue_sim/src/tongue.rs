@@ -370,6 +370,64 @@ mod tests {
     }
 
     #[test]
+    fn damping_is_taken_against_the_anchor_and_never_against_the_world() {
+        // Two bodies drifting together at the same speed are not closing on
+        // each other at all, so the Tongue is being carried rather than
+        // stretched and the damping term must be identically zero. A Tongue
+        // that damped against the body's absolute velocity would brake a hero
+        // and an Enemy flying in formation, which is a force out of nowhere.
+        const ANCHOR: Vec2 = Vec2::new(0.0, 10.0);
+        const DRIFT: Vec2 = Vec2::new(0.0, 25.0);
+
+        let mut carried = Pulls::default();
+        carried.push_moving(ANCHOR, DRIFT, 40.0);
+        let mut terrain = Pulls::default();
+        terrain.push(ANCHOR, 40.0);
+
+        let still = terrain.force(Vec2::ZERO, Vec2::ZERO);
+        assert_eq!(
+            carried.force(Vec2::ZERO, DRIFT),
+            still,
+            "a Tongue whose Anchor moves with the body must damp nothing"
+        );
+        // Vacuity guard: the same body velocity against *terrain* does damp, so
+        // the equality above is a property of the Anchor's velocity and not of
+        // a damping term that is zero for every input.
+        assert_ne!(
+            terrain.force(Vec2::ZERO, DRIFT),
+            still,
+            "the fixture's drift is too small to damp, so nothing above was tested"
+        );
+    }
+
+    #[test]
+    fn the_two_ends_of_one_tongue_feel_exactly_opposite_forces() {
+        // Newton's third law at the level of the force law itself, which is
+        // what makes the mass-ratio pull in ADR-0003 well defined. Asserted as
+        // an exact sum rather than a tolerance: both ends are computed from one
+        // Stretch, one direction and one relative radial velocity, so the only
+        // difference between them is a sign and float arithmetic has no room to
+        // introduce another.
+        let (hero_pos, hero_vel) = (Vec2::new(1.0, 2.0), Vec2::new(-3.0, 7.0));
+        let (enemy_pos, enemy_vel) = (Vec2::new(9.0, -4.0), Vec2::new(2.0, 1.0));
+        let on_hero = pull(hero_pos, hero_vel - enemy_vel, enemy_pos, 40.0);
+        let on_enemy = pull(enemy_pos, enemy_vel - hero_vel, hero_pos, 40.0);
+
+        assert_eq!(
+            on_hero + on_enemy,
+            Vec2::ZERO,
+            "the pair gains {:?} out of nothing",
+            on_hero + on_enemy
+        );
+        // Vacuity guard: a Tongue that was slack, or whose force had been
+        // clamped to zero, would sum to zero trivially.
+        assert!(
+            on_hero.length() > 1.0,
+            "the fixture's Tongue pulls almost nothing: {on_hero:?}"
+        );
+    }
+
+    #[test]
     fn pull_uses_the_prototypes_measured_defaults() {
         // The wrapper must not invent its own damping or ceiling. Checked
         // against the free function with the constants passed explicitly, so a

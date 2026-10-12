@@ -504,6 +504,52 @@ mod tests {
             }
         }
 
+        #[test]
+        fn both_slots_on_one_enemy_pull_it_twice_as_hard() {
+            // ADR-0003's force ceiling is per Tongue rather than per hero, and
+            // the reaction is drawn from that same budget, so an Enemy held by
+            // both slots feels up to `MAX_TONGUES * DEFAULT_FORCE_CEILING` just
+            // as the hero does. Worth pinning rather than inferring: the
+            // tempting fix of summing the reactions and then clamping would
+            // mean a Tongue that weakened because another one existed, which is
+            // precisely the property ADR-0003 exists to provide.
+            let mut one = World::from_level(&duel(1.0));
+            tap(&mut one, 1, Vec2::new(10.0, 0.0));
+            one.step();
+            let single = one.snapshot().body(enemy_of(&one)).expect("enemy").pos.x - 10.0;
+
+            let mut two = World::from_level(&duel(1.0));
+            // Two overlapping fingers in one frame, aimed at the same Enemy.
+            // ADR-0006 makes that the only way to hold two Tongues at once.
+            two.apply_touches(&[
+                TouchSample {
+                    id: 1,
+                    phase: TouchPhase::Started,
+                    pos: Vec2::new(10.0, 0.0),
+                },
+                TouchSample {
+                    id: 2,
+                    phase: TouchPhase::Started,
+                    pos: Vec2::new(10.0, 0.0),
+                },
+            ]);
+            two.step();
+            assert_eq!(
+                two.snapshot().tongues.len(),
+                2,
+                "the fixture must hold two Tongues on one Enemy: {:?}",
+                two.snapshot().tongues
+            );
+            let doubled = two.snapshot().body(enemy_of(&two)).expect("enemy").pos.x - 10.0;
+
+            assert!(single < 0.0, "one Tongue must pull the Enemy in: {single}");
+            assert!(
+                (doubled / single - 2.0).abs() < 1e-3,
+                "two Tongues on one Enemy pulled it {}x and not 2x",
+                doubled / single
+            );
+        }
+
         /// How many ticks the `duel` fixture stays a clean two-body problem.
         ///
         /// At `DEFAULT_PULL_STRENGTH` with a 9 unit Stretch the hero

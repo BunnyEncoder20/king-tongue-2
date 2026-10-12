@@ -202,6 +202,70 @@ pub fn braces_between_two_anchors(tick: u64, world: &mut World) {
     }
 }
 
+/// Attaches to an Enemy, braces against terrain with a second Tongue so all
+/// three bodies are coupled, then flings the Enemy out of the Kill Bound and
+/// keeps Swinging on what is left.
+///
+/// The Movable Anchor run the ticket #17 AC asks for, and it is the richest
+/// trace in this module: it is the only one where the **Tongue** count and the
+/// **body** count both change mid-run, and where they change for connected
+/// reasons. Three things in it can lose determinism and nothing earlier could.
+///
+/// A Movable Anchor is resolved from simulation state on every tick rather than
+/// being a constant, so a divergence in the Enemy's position reaches the hero's
+/// force on the same tick instead of waiting for the next tap. The three-body
+/// phase makes both bodies' forces depend on each other, so anything that read
+/// one body's half-updated state would show up as the pair's momentum differing
+/// between runs. And ADR-0014's slot sweep runs after two separate removals, so
+/// a sweep that ran at a different point in the tick on one pass than on another
+/// would free the slot a tick early in one run and never in the other.
+///
+/// The fling is scripted rather than earned by a Slam. Both ways of losing a
+/// body would free the slot, and a script where either could have happened
+/// could not say which one had diverged. Nothing here carries enough momentum
+/// to empty a sketched Enemy's 100 Toughness, so every removal in this trace is
+/// the Kill Bound's.
+pub fn swings_on_an_enemy(tick: u64, world: &mut World) {
+    const UP: Vec2 = Vec2::new(0.0, 4.0);
+    // Shallow on purpose. By tick 40 the mass-ratio pull has carried the hero
+    // most of the way up to the Enemy, and a steeper aim from there leaves the
+    // sketch through the open sky above the wall rather than meeting it, which
+    // is a tap that Attaches nothing and a three-body phase that never happens.
+    const UP_LEFT: Vec2 = Vec2::new(-4.0, 1.0);
+    const HOLD_1: (u64, TouchPhase, Vec2) = (1, TouchPhase::Stationary, UP);
+    const HOLD_2: (u64, TouchPhase, Vec2) = (2, TouchPhase::Stationary, UP_LEFT);
+    match tick {
+        // Straight up at the Enemy. The ray strikes it, so this is an Attach to
+        // the body and not to the open sky behind it.
+        10 => aim_all(world, &[(1, TouchPhase::Started, UP)]),
+        // The second finger lands while the first is still down, which ADR-0006
+        // makes the only way to hold two Tongues. One Movable Anchor and one
+        // Fixed, which is the three-body system ADR-0003 describes.
+        40 => aim_all(world, &[HOLD_1, (2, TouchPhase::Started, UP_LEFT)]),
+        // Flung straight up and out of the bound. Scripted rather than left to
+        // the pull, which carries the Enemy out of the sketch on its own by
+        // tick 105, so that the tick the body count changes on is one this file
+        // chose: a removal somewhere in the middle of a Swing could not say
+        // whether the Kill Bound or an impact had taken it.
+        60 => {
+            let hero = world.hero_id();
+            let enemy: Option<(crate::EntityId, Vec2)> = world
+                .snapshot()
+                .bodies
+                .iter()
+                .find(|b| b.id != hero)
+                .map(|b| (b.id, b.pos));
+            if let Some((id, pos)) = enemy {
+                world.place(id, pos, Vec2::new(0.0, 90.0));
+            }
+            aim_all(world, &[HOLD_1, HOLD_2]);
+        }
+        11..=39 => aim_all(world, &[HOLD_1]),
+        41..=59 | 61.. => aim_all(world, &[HOLD_1, HOLD_2]),
+        _ => {}
+    }
+}
+
 /// Taps three times in the same frame, every frame, forever.
 ///
 /// Hostile input as a script. Three concurrent ids must leave two Tongues, and
@@ -682,6 +746,126 @@ mod tests {
                 .iter()
                 .all(|t| t.to.is_finite() && t.from.is_finite()),
             "a Tongue endpoint went non-finite: {:?}",
+            last.tongues
+        );
+    }
+
+    /// A hero with an Enemy four units straight above it, walls on both sides
+    /// for a Fixed Anchor, and **open sky above**, so an Enemy flung upward
+    /// leaves the Kill Bound instead of stopping against a ceiling.
+    ///
+    /// Flush to the left margin, because `from_ascii` counts leading
+    /// indentation as columns and the four unit gap is the whole point: at
+    /// `REST_LENGTH` of 1 that is a Stretch of 3, so the Tongue is genuinely
+    /// loaded rather than slack.
+    fn enemy_overhead_scene() -> Level {
+        Level::from_ascii(
+            "\
+#.........#
+#....e....#
+#.........#
+#.........#
+#.........#
+#....@....#
+###########
+",
+        )
+    }
+
+    #[test]
+    fn swinging_on_an_enemy_produces_identical_snapshot_sequences() {
+        // Ticket #17's determinism clause, over the Movable Anchor. Every
+        // earlier script resolves its Anchors from level data or from a tap;
+        // this one resolves one of them from another body's position on every
+        // single tick, so a divergence anywhere in the Enemy's motion reaches
+        // the hero's force immediately rather than waiting for the next tap.
+        assert_deterministic(&enemy_overhead_scene(), 300, swings_on_an_enemy);
+    }
+
+    #[test]
+    fn the_enemy_anchor_script_really_holds_a_movable_anchor_and_then_loses_it() {
+        // Guards the test above from passing vacuously, and there are three
+        // separate ways for it to be vacuous here: the tap could have missed
+        // the Enemy and Attached to the sky behind it, the second finger could
+        // have failed to give a three-body phase, and the fling could have left
+        // the Enemy inside the bound so the slot was never freed. Each is
+        // checked, because any one of them leaves a perfectly deterministic run
+        // that proves nothing about a Movable Anchor.
+        let trace = record(&enemy_overhead_scene(), 300, swings_on_an_enemy);
+        let anchors = |tick: usize| -> Vec<crate::Anchor> {
+            let mut a: Vec<_> = trace[tick]
+                .tongues
+                .iter()
+                .map(|t| (t.slot, t.anchor))
+                .collect();
+            a.sort_by_key(|(slot, _)| *slot);
+            a.into_iter().map(|(_, anchor)| anchor).collect()
+        };
+
+        let attached = anchors(11);
+        assert!(
+            matches!(attached.as_slice(), [crate::Anchor::Movable(_)]),
+            "the first Gesture must Attach to the Enemy itself, got {attached:?}"
+        );
+        let braced = anchors(41);
+        assert_eq!(
+            braced.len(),
+            2,
+            "two overlapping fingers must hold two Tongues"
+        );
+        assert!(
+            braced
+                .iter()
+                .any(|a| matches!(a, crate::Anchor::Movable(_)))
+                && braced.iter().any(|a| matches!(a, crate::Anchor::Fixed(_))),
+            "the three-body phase needs one Movable Anchor and one Fixed, got {braced:?}"
+        );
+
+        // The Enemy really left, and the Kill Bound is the only thing that
+        // could have taken it: the removal lands on the tick the fling put it
+        // outside the sketch, and a sketched Enemy's 100 Toughness is far above
+        // anything in this run.
+        let bodies = |tick: usize| trace[tick].bodies.len();
+        assert_eq!(bodies(0), 2, "one hero and one Enemy");
+        assert_eq!(
+            bodies(62),
+            2,
+            "the Enemy must survive until the fling lands"
+        );
+        assert_eq!(bodies(63), 1, "the fling must despawn the Enemy");
+
+        // And the slot went with it, on exactly that tick rather than a tick
+        // later or never. Both halves matter: the Movable slot is free, and the
+        // Fixed one beside it is untouched, so the sweep took the dead Anchor
+        // and not simply every Tongue it could see.
+        assert_eq!(
+            anchors(62).len(),
+            2,
+            "both Tongues must still be Attached the tick before: {:?}",
+            anchors(62)
+        );
+        let after = anchors(63);
+        assert!(
+            matches!(after.as_slice(), [crate::Anchor::Fixed(_)]),
+            "the dead Anchor's slot must be freed and the Fixed one kept, got {after:?}"
+        );
+        assert_eq!(
+            after,
+            braced
+                .iter()
+                .copied()
+                .filter(|a| matches!(a, crate::Anchor::Fixed(_)))
+                .collect::<Vec<_>>(),
+            "the surviving Tongue must be on the Anchor it has held all along"
+        );
+        // And it stays free for the rest of the run rather than coming back.
+        let last = trace.last().expect("a trace is never empty");
+        assert!(
+            !last
+                .tongues
+                .iter()
+                .any(|t| matches!(t.anchor, crate::Anchor::Movable(_))),
+            "a Movable Anchor reappeared after its body was gone: {:?}",
             last.tongues
         );
     }
