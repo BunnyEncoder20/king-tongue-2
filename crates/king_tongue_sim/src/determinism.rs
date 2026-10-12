@@ -266,6 +266,109 @@ pub fn swings_on_an_enemy(tick: u64, world: &mut World) {
     }
 }
 
+/// Attaches to an Enemy far enough away to Throw it outright, then holds the
+/// Tongue while the weapon barrels back and destroys itself on terrain.
+///
+/// The Thrown run ticket #18's AC asks for, and the whole of it is emergent:
+/// nothing in this script places a body or assigns a velocity. The tap is the
+/// only input, and everything after it is the tension threshold, the inverted
+/// matrix and ADR-0014's slot sweep agreeing with each other.
+///
+/// Three things in it can lose determinism and nothing earlier could. The
+/// promotion is a **kind change mid-run**, which no previous trace carries, and
+/// it is decided from a force reading parked in the half-step, so a reading
+/// taken at a different point in the tick on one pass than on another would
+/// promote a tick early in one run and never in the other. The terrain row is
+/// decided from the sweep's contact count, which is the integrator's own state
+/// rather than a fresh test. And the removal it causes changes the body count
+/// at a point in the tick no earlier removal sits at, between the impacts and
+/// the Kill Bound.
+///
+/// What the run actually does, which is worth writing down because none of it
+/// was scripted: the hero and the weapon rush together and **pass through each
+/// other** around tick 23, since a Thrown Enemy striking the hero is the branch
+/// ticket #18 deliberately leaves out. The spring then reverses and the pair
+/// orbits, descending under gravity the whole time, until the weapon settles
+/// onto the floor on tick 79 and the terrain row removes it. The hero is left
+/// Swinging on a freed slot.
+///
+/// No surface is aimed at. A script that depended on hitting one specific wall
+/// would be the trap ticket #17's determinism script fell into, where a scene
+/// valid when it was written was missed by the tick it actually fired; here the
+/// weapon is inside a closed room with a floor under it and gravity on, so
+/// terrain is where it ends up however the orbit goes.
+pub fn throws_an_enemy(tick: u64, world: &mut World) {
+    // Up and to the right, at the Enemy the scene puts there. Relative to the
+    // hero, like every other script here, so the tap's result depends on every
+    // tick before it.
+    const AT_ENEMY: Vec2 = Vec2::new(20.0, 3.0);
+    const HOLD: (u64, TouchPhase, Vec2) = (1, TouchPhase::Stationary, AT_ENEMY);
+    match tick {
+        10 => aim_all(world, &[(1, TouchPhase::Started, AT_ENEMY)]),
+        // Held for the rest of the run. ADR-0006 makes attachment outlast the
+        // finger, so this is not what keeps the Tongue Attached; what it does
+        // is keep slot 0 **owned**, so no later frame of this script can be
+        // read as a Release and the run is the pull and nothing else.
+        11.. => aim_all(world, &[HOLD]),
+        _ => {}
+    }
+}
+
+/// The same opening, with the weapon then aimed into a second Enemy of its own
+/// weight class so that both are vaporized on one tick.
+///
+/// ADR-0011's third inverted row, in a trace. It is the only script in this
+/// module where **two bodies leave on the same tick** and the Tongue's slot
+/// leaves with them, which is a different hazard from losing one body: a sweep
+/// that resolved the matrix against a body list it had already shortened would
+/// read the second removal against the wrong index, and the tick it noticed
+/// would differ between runs only once the two lists had drifted.
+///
+/// The strike is scripted rather than earned, exactly as `swings_on_an_enemy`
+/// scripts its fling and for the same reason. The pull is always *toward* the
+/// hero, so an Enemy on the flight path when the tap went out would have been
+/// the nearer target and ADR-0012's arc would have Attached to it instead;
+/// placing the weapon is how one trace gets a projectile and a victim on one
+/// line, and it fixes the tick the body count changes on rather than leaving it
+/// to a Swing nobody could attribute afterwards.
+pub fn throws_an_enemy_into_another(tick: u64, world: &mut World) {
+    const AT_ENEMY: Vec2 = Vec2::new(20.0, 3.0);
+    const HOLD: (u64, TouchPhase, Vec2) = (1, TouchPhase::Stationary, AT_ENEMY);
+    if tick == 12 {
+        // Both bodies read out of the `Snapshot` by identity rather than
+        // written as coordinates, so the script cannot drift out of step with
+        // the scene it is run against. The weapon is whichever Enemy the
+        // Snapshot says is Thrown, which is the state this script is about.
+        let hero = world.hero_id();
+        let bodies: Vec<(crate::EntityId, crate::BodyKind, Vec2)> = world
+            .snapshot()
+            .bodies
+            .iter()
+            .filter(|b| b.id != hero)
+            .map(|b| (b.id, b.kind, b.pos))
+            .collect();
+        let weapon = bodies
+            .iter()
+            .find(|(_, kind, _)| *kind == crate::BodyKind::Thrown)
+            .copied();
+        let victim = bodies
+            .iter()
+            .find(|(_, kind, _)| *kind == crate::BodyKind::Enemy)
+            .copied();
+        if let (Some((id, _, _)), Some((_, _, at))) = (weapon, victim) {
+            // Three units short of the victim and fast enough to cross that in
+            // one tick, so the strike is a swept contact and not an overlap
+            // that was placed there.
+            world.place(id, at - Vec2::new(3.0, 0.0), Vec2::new(180.0, 0.0));
+        }
+    }
+    match tick {
+        10 => aim_all(world, &[(1, TouchPhase::Started, AT_ENEMY)]),
+        11.. => aim_all(world, &[HOLD]),
+        _ => {}
+    }
+}
+
 /// Taps three times in the same frame, every frame, forever.
 ///
 /// Hostile input as a script. Three concurrent ids must leave two Tongues, and
@@ -957,6 +1060,264 @@ mod tests {
                 .any(|t| matches!(t.anchor, crate::Anchor::Movable(_))),
             "a Movable Anchor reappeared after its body was gone: {:?}",
             last.tongues
+        );
+    }
+
+    /// A hero in the bottom left corner of a tall room with one Enemy twenty
+    /// units away and three up, and nothing between them.
+    ///
+    /// Flush to the left margin, because `from_ascii` counts leading
+    /// indentation as columns and every distance here is the point. Twenty
+    /// units of reach is a Stretch of 19.2 at `REST_LENGTH` 1, which puts 769
+    /// of tension on a sketched Enemy's mass of 1 against a threshold of 500,
+    /// so the Attach Throws it outright rather than merely tracking it.
+    ///
+    /// Both Enemies sit two rows clear of the ceiling and the side wall. That
+    /// is load-bearing rather than tidy: a sketched body in the row directly
+    /// below terrain rests exactly tangent to it, which is a genuine contact,
+    /// and a Thrown body in one would be destroyed by the surface it spawned
+    /// against before anything else in the trace happened.
+    fn throw_scene() -> Level {
+        Level::from_ascii(
+            "\
+########################
+#......................#
+#....................e.#
+#......................#
+#......................#
+#@.....................#
+########################
+",
+        )
+    }
+
+    /// The same room with a second Enemy of the same weight, far enough off the
+    /// tapped vector that ADR-0012's arc cannot prefer it.
+    ///
+    /// Seven units along and three up is 23 degrees off the hero, against the
+    /// weapon's 8.5, so the two are 14 degrees apart and the arc is 10 wide.
+    /// The ray passes well under the victim's box, so it is not struck either.
+    fn throw_and_strike_scene() -> Level {
+        Level::from_ascii(
+            "\
+########################
+#......................#
+#.......e............e.#
+#......................#
+#......................#
+#@.....................#
+########################
+",
+        )
+    }
+
+    #[test]
+    fn throwing_an_enemy_into_terrain_produces_identical_snapshot_sequences() {
+        // Ticket #18's determinism clause. The Thrown state puts two things in
+        // a trace that nothing before it could: a body's **kind** changing
+        // mid-run, and a removal decided from the integrator's own contact
+        // state at a point in the tick no earlier removal sits at.
+        assert_deterministic(&throw_scene(), 300, throws_an_enemy);
+    }
+
+    #[test]
+    fn the_throw_script_really_throws_an_enemy_and_really_loses_it_to_terrain() {
+        // Guards the test above from passing vacuously, and there are three
+        // separate ways for it to be vacuous: the tap could have Attached to
+        // the ceiling behind the Enemy, the tension could have left the Enemy
+        // merely tracking, and the removal could have been the Kill Bound
+        // rather than terrain. Each is checked, because any one of them leaves
+        // a perfectly deterministic run that says nothing about the Thrown
+        // state. The last is the one ADR-0011 warns is easy to confuse.
+        let trace = record(&throw_scene(), 300, throws_an_enemy);
+        // Both bodies by identity, never by slice position: `hero_id` is the
+        // contract's own answer and the Enemy is the other one.
+        let hero = World::from_level(&throw_scene()).hero_id();
+        let enemy = trace[0]
+            .bodies
+            .iter()
+            .map(|b| b.id)
+            .find(|id| *id != hero)
+            .expect("the scene has a hero and one Enemy");
+
+        assert!(
+            matches!(
+                trace[11].tongues.as_slice(),
+                [t] if t.anchor == crate::Anchor::Movable(enemy)
+            ),
+            "the tap must Attach to the Enemy itself: {:?}",
+            trace[11].tongues
+        );
+        assert_eq!(
+            trace[10].body(enemy).map(|b| b.kind),
+            Some(crate::BodyKind::Enemy),
+            "the Enemy must be a target until the Tongue is Attached"
+        );
+        assert_eq!(
+            trace[11].body(enemy).map(|b| b.kind),
+            Some(crate::BodyKind::Thrown),
+            "the tension must Throw it on the first tick the Tongue pulls"
+        );
+
+        // It leaves, once, and the tick it leaves on is the tick its slot is
+        // freed. Both halves matter: a slot freed a tick late would still be
+        // deterministic.
+        let gone = (0..trace.len())
+            .find(|t| trace[*t].body(enemy).is_none())
+            .expect("the weapon must leave the simulation");
+        // Measured at 79: the pair orbits while gravity brings it down, and
+        // the weapon settles onto the floor there. Bracketed on both sides,
+        // because "immediately" would mean it died against the surface it
+        // spawned beside and "never" would mean the terrain row was not
+        // reached at all, and only one of those two is a vacuity guard.
+        assert!(
+            (20..160).contains(&gone),
+            "the weapon left on tick {gone}, outside the window the terrain \
+             crash lands in"
+        );
+        assert!(
+            trace[gone].tongues.is_empty(),
+            "the dead Anchor's slot must be free on the same tick: {:?}",
+            trace[gone].tongues
+        );
+        assert!(
+            trace[gone - 1]
+                .tongues
+                .iter()
+                .any(|t| t.anchor == crate::Anchor::Movable(enemy)),
+            "the Tongue must have been Attached the tick before"
+        );
+
+        // And terrain is the only thing that could have taken it. The Kill
+        // Bound is the sketch's own extent, and the weapon's last position is
+        // well inside it; a sketched Enemy carries 100 Toughness, and the hero
+        // cannot spend momentum against a Thrown body at all.
+        let last = trace[gone - 1].body(enemy).expect("alive").pos;
+        let bound = throw_scene().world_bounds;
+        let margin = (last - bound.centre).abs();
+        assert!(
+            margin.x < bound.half_extents.x - 1.0 && margin.y < bound.half_extents.y - 1.0,
+            "the weapon was at {last:?}, close enough to the Kill Bound \
+             {bound:?} that the removal cannot be attributed to terrain"
+        );
+        // The hero is untouched by any of it and is still in the simulation,
+        // because nothing may destroy the hero yet.
+        assert_eq!(
+            trace[gone].bodies.len(),
+            1,
+            "only the weapon may leave: {:?}",
+            trace[gone].bodies
+        );
+
+        // And the deferred branch is in this trace too, which is the thing a
+        // reader would most want to know had been exercised: the two bodies
+        // swap sides, so the hero flew straight through a Thrown Enemy and
+        // nothing happened to either of them. ADR-0011 would destroy the hero
+        // here; ticket #18 leaves that out, so this is what the trace shows
+        // instead.
+        let side = |tick: usize| {
+            let h = trace[tick].body(hero).expect("the hero survives").pos;
+            trace[tick].body(enemy).map(|b| b.pos.x - h.x)
+        };
+        assert_eq!(side(11).map(f32::is_sign_positive), Some(true));
+        let crossed = (12..gone).any(|t| side(t).is_some_and(f32::is_sign_negative));
+        assert!(
+            crossed,
+            "the hero and the weapon never met, so the run says nothing about \
+             the branch that is deliberately absent"
+        );
+    }
+
+    #[test]
+    fn throwing_an_enemy_into_another_produces_identical_snapshot_sequences() {
+        // The mutual row, in a trace. Two bodies leave on one tick and the
+        // Tongue's slot leaves with them, which is a different hazard from
+        // losing one body: a matrix resolved against a body list that had
+        // already been shortened would read the second removal against the
+        // wrong index.
+        assert_deterministic(&throw_and_strike_scene(), 300, throws_an_enemy_into_another);
+    }
+
+    #[test]
+    fn the_strike_script_really_vaporizes_both_enemies_on_one_tick() {
+        // Guards the test above, and the vacuity risk here is specific: if the
+        // placed weapon missed, the run would still be deterministic, the
+        // weapon would still die on terrain eventually, and the body count
+        // would still fall. Only "both, on the same tick, with neither near the
+        // Kill Bound" distinguishes the mutual row from two unrelated deaths.
+        let trace = record(&throw_and_strike_scene(), 300, throws_an_enemy_into_another);
+        let counts: Vec<usize> = trace.iter().map(|s| s.bodies.len()).collect();
+        assert_eq!(counts[0], 3, "one hero and two Enemies");
+
+        let Some(both) = counts
+            .windows(2)
+            .position(|w| w[0] == 3 && w[1] == 1)
+            .map(|i| i + 1)
+        else {
+            panic!("two Enemies must leave on one tick: {counts:?}");
+        };
+        assert!(
+            (12..20).contains(&both),
+            "the strike landed on tick {both} rather than just after the placement"
+        );
+        assert!(
+            trace[both].tongues.is_empty(),
+            "mutual destruction must free the player's Anchor slot: {:?}",
+            trace[both].tongues
+        );
+        // Neither was anywhere near the Kill Bound, so this is the matrix and
+        // not the sketch's edge taking two bodies at once.
+        let bound = throw_and_strike_scene().world_bounds;
+        for body in &trace[both - 1].bodies {
+            let margin = (body.pos - bound.centre).abs();
+            assert!(
+                margin.x < bound.half_extents.x - 1.0 && margin.y < bound.half_extents.y - 1.0,
+                "{body:?} sat on the Kill Bound {bound:?}, so the removal is ambiguous"
+            );
+        }
+        // One of them really was a weapon and the other really was a target,
+        // which is what makes it the mutual row rather than two weapons.
+        let kinds: Vec<crate::BodyKind> = trace[both - 1].bodies.iter().map(|b| b.kind).collect();
+        assert!(
+            kinds.contains(&crate::BodyKind::Thrown) && kinds.contains(&crate::BodyKind::Enemy),
+            "the strike must be a weapon against a target, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn the_harness_notices_a_kind_that_differs_and_nothing_else() {
+        // The Thrown state makes a body's kind something two runs can disagree
+        // on while every position agrees to the bit, which was unreachable
+        // before this ticket: nothing changed kind. A comparison that skipped
+        // it would report success on exactly that divergence. Built by hand
+        // because no scene can produce the case, for the same reason the Combo
+        // guard beside it is built by hand.
+        let snapshot = |kind| Snapshot {
+            tick: 7,
+            combo: 0,
+            bodies: vec![crate::Body {
+                id: crate::EntityId(1),
+                kind,
+                pos: Vec2::ZERO,
+                facing: Vec2::X,
+            }],
+            tongues: vec![],
+        };
+        assert!(
+            first_divergence(
+                &[snapshot(crate::BodyKind::Enemy)],
+                &[snapshot(crate::BodyKind::Thrown)]
+            )
+            .is_some(),
+            "an Enemy against a Thrown Enemy must be reported as a divergence"
+        );
+        assert!(
+            first_divergence(
+                &[snapshot(crate::BodyKind::Thrown)],
+                &[snapshot(crate::BodyKind::Thrown)]
+            )
+            .is_none(),
+            "identical snapshots must not be reported as divergent"
         );
     }
 
