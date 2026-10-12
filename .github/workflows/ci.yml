@@ -2,9 +2,19 @@
 # architecture boundaries the ADRs describe.
 name: ci
 
+# Every branch the project actually works on, not just `main`. A `[main]`-only
+# filter made this workflow inert for a whole implementation run: ten ticket
+# branches and roughly fifty commits were pushed to `integration/core-mechanics`
+# with no pull request open, so CI ran zero times while every report said the
+# gate was green. The gate was a human running commands by hand.
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "integration/**"
+      - "ticket/**"
+      - "fix/**"
+      - "chore/**"
   pull_request:
 
 jobs:
@@ -44,6 +54,23 @@ jobs:
       # otherwise only surface by launching. ADR-0010.
       - name: Shipped level assets parse
         run: cargo run --example parse_check -p king_tongue_sim --features serde
+
+      # Prose uses colons, semicolons, commas and parentheses. The rule is
+      # mechanical, so it belongs here rather than in a brief: it used to be
+      # repeated into every agent brief by hand and checked by a human grep at
+      # every merge, which is one rule written N times plus a step that can be
+      # forgotten. The pattern is written as an escape so this file does not
+      # contain the character it bans and therefore cannot match itself.
+      - name: Prose carries no em-dashes
+        run: |
+          if grep -rnP '\x{2014}' \
+              --include='*.rs' --include='*.md' --include='*.toml' \
+              --include='*.yml' --include='*.sh' \
+              --exclude-dir=target --exclude-dir=.git .; then
+            echo "FAIL: em-dash (U+2014) found at the lines above." >&2
+            echo "Use a colon, semicolon, comma or parentheses instead." >&2
+            exit 1
+          fi
 
       - run: cargo fmt --all --check
 

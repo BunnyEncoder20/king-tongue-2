@@ -1,0 +1,31 @@
+#!/bin/sh
+# Runs the cheap half of the project gate before a commit is written, so a
+# commit cannot carry a failure CI would reject.
+#
+# This exists because `07dc945` was committed with a clippy error that the
+# repo's own CI would have failed, then fixed in `1ccd468`. The gate was run
+# after committing instead of before, which is a question of ordering and not
+# of diligence, so it is enforced here rather than remembered.
+#
+# Lints only. The test suite and the Android cross-compile belong in CI: a hook
+# slow enough to be worth skipping gets skipped, and then it guards nothing.
+#
+# Wiring, once per clone:
+#
+#     git config core.hooksPath scripts/hooks
+#
+# `core.hooksPath` is why the hook lives here rather than in `.git/hooks`:
+# this directory is version-controlled, so the guard arrives with the repo
+# instead of being reinstalled from memory on every machine.
+#
+# To commit deliberately past a failure, `git commit --no-verify`.
+
+set -e
+
+echo "pre-commit: cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "pre-commit: cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "pre-commit: ok"
