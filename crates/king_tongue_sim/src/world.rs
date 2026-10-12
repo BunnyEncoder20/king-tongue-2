@@ -66,9 +66,11 @@ struct BodyState {
     /// map's fog, so nothing may destroy the hero yet, and an infinite pool says
     /// that in the same terms everything else uses.
     toughness: f32,
-    /// Whether the hero was in contact at the end of the previous Sim Tick, so
-    /// that one pass costs one impact. See `combat::EnemyTarget::touching`.
-    touching_hero: bool,
+    /// Whether an impact has already been spent against the contact the hero is
+    /// currently in with this body, so that one pass costs one impact. See
+    /// `combat::EnemyTarget::spent`, which holds why this is the allowance alone
+    /// and not also a record of being in contact.
+    impact_spent: bool,
 }
 
 /// All simulation state, and the only way to advance it.
@@ -190,7 +192,7 @@ impl World {
             facing: Vec2::X,
             mass: DEFAULT_PLAYER_MASS,
             toughness: f32::INFINITY,
-            touching_hero: false,
+            impact_spent: false,
         });
 
         for spawn in &level.enemy_spawns {
@@ -203,7 +205,7 @@ impl World {
                 facing: Vec2::X,
                 mass: spawn.mass,
                 toughness: spawn.toughness,
-                touching_hero: false,
+                impact_spent: false,
             });
         }
 
@@ -724,14 +726,14 @@ impl World {
                     vel: enemy.vel,
                     mass: enemy.mass,
                     toughness: enemy.toughness,
-                    touching: enemy.touching_hero,
+                    spent: enemy.impact_spent,
                 },
             );
 
             self.bodies[h].vel = resolved.hero_vel;
             self.bodies[i].vel = resolved.enemy_vel;
             self.bodies[i].toughness = resolved.toughness;
-            self.bodies[i].touching_hero = resolved.touching;
+            self.bodies[i].impact_spent = resolved.spent;
 
             if Combo::counts_as_slam(resolved.band) {
                 slams += 1;

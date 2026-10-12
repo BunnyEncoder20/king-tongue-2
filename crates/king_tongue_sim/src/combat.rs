@@ -103,14 +103,29 @@ pub struct EnemyTarget {
     pub mass: f32,
     /// Remaining `Toughness`, in momentum units.
     pub toughness: f32,
-    /// Whether the hero was already in contact at the end of the previous tick.
+    /// Whether an impact has already been spent against the contact currently
+    /// in progress.
     ///
     /// This is what makes one pass cost one hit. Without it a hero travelling
     /// slowly enough to spend several ticks inside an Enemy would spend its
     /// momentum against the pool once per tick, and "chip a heavy Enemy over
     /// several passes" would collapse into emptying any pool in a third of a
     /// second.
-    pub touching: bool,
+    ///
+    /// **One meaning and not two, which it used to carry.** This is the
+    /// allowance alone and never "the bodies are in contact": the two are
+    /// different questions, because a tick can be in contact and register
+    /// nothing at all. ADR-0011's fourth outcome beside the three bands has a
+    /// separating body register nothing, and nothing is also what it spends, so
+    /// a separating tick carries this through untouched rather than arming it.
+    /// Arming it there armed a flag meaning "already spent" with nothing spent,
+    /// and the next tick's genuine Slam was then silently discarded; a hero
+    /// hanging on a Movable Anchor reaches that every spring cycle, because
+    /// `REST_LENGTH` equals the hero's radius plus an Enemy's half extent.
+    ///
+    /// Whether the bodies are in contact is read off the sweep, where it is
+    /// known exactly, so losing contact is what clears this.
+    pub spent: bool,
 }
 
 /// What one tick of hero-against-Enemy resolution did.
@@ -123,8 +138,9 @@ pub struct Resolution {
     pub enemy_vel: Vec2,
     /// The Enemy's remaining `Toughness`. Zero or below means destroyed.
     pub toughness: f32,
-    /// Whether the bodies are in contact now, to be carried into the next tick.
-    pub touching: bool,
+    /// The one-hit-per-contact allowance, to be carried into the next tick. See
+    /// [`EnemyTarget::spent`] for why it is only ever that.
+    pub spent: bool,
     /// Which band resolved, or `None` if nothing registered: no contact, the
     /// bodies separating, or a contact already spent on an earlier tick.
     pub band: Option<ImpactBand>,
@@ -133,12 +149,12 @@ pub struct Resolution {
 impl Resolution {
     /// Nothing happened: the caller writes this back and the tick is unchanged
     /// apart from the contact flag.
-    fn inert(hero: &HeroPass, enemy: &EnemyTarget, touching: bool) -> Self {
+    fn inert(hero: &HeroPass, enemy: &EnemyTarget, spent: bool) -> Self {
         Resolution {
             hero_vel: hero.vel,
             enemy_vel: enemy.vel,
             toughness: enemy.toughness,
-            touching,
+            spent,
             band: None,
         }
     }
@@ -162,8 +178,8 @@ impl Resolution {
 pub fn resolve_contact(hero: &HeroPass, enemy: &EnemyTarget) -> Resolution {
     let box_ = Aabb::new(enemy.pos, ENEMY_HALF_EXTENTS);
     let Some(contact) = swept_contact(hero.start, hero.end - hero.start, hero.radius, box_) else {
-        // Out of contact clears the contact flag, which is what lets the next
-        // pass register.
+        // Out of contact clears the allowance, which is what lets the next pass
+        // register: contact ended, so the next one is a new contact.
         return Resolution::inert(hero, enemy, false);
     };
 
@@ -179,7 +195,10 @@ pub fn resolve_contact(hero: &HeroPass, enemy: &EnemyTarget) -> Resolution {
     // below what the absolute form would have scored.
     let closing = (enemy.vel - hero.vel).dot(contact.normal);
     if closing <= 0.0 {
-        return Resolution::inert(hero, enemy, true);
+        // ADR-0011's fourth outcome: a separating body registers nothing. It
+        // spends nothing either, so the allowance is carried through rather
+        // than armed. See [`EnemyTarget::spent`].
+        return Resolution::inert(hero, enemy, enemy.spent);
     }
     let normal_momentum = hero.mass * closing;
 
@@ -192,17 +211,17 @@ pub fn resolve_contact(hero: &HeroPass, enemy: &EnemyTarget) -> Resolution {
         return Resolution {
             hero_vel: separated.0,
             enemy_vel: separated.1,
-            toughness: if enemy.touching {
+            toughness: if enemy.spent {
                 enemy.toughness
             } else {
                 enemy.toughness - KICK_DAMAGE
             },
-            touching: true,
+            spent: true,
             band: Some(ImpactBand::Kick),
         };
     }
 
-    if enemy.touching {
+    if enemy.spent {
         // A Slam already spent on this contact. The hero carries straight on
         // through: a Slam does not bounce.
         return Resolution::inert(hero, enemy, true);
@@ -218,7 +237,7 @@ pub fn resolve_contact(hero: &HeroPass, enemy: &EnemyTarget) -> Resolution {
         // deliberately does not: that is the hero becoming unstoppable.
         enemy_vel: enemy.vel + drain / enemy.mass,
         toughness: enemy.toughness - spent,
-        touching: true,
+        spent: true,
         band: Some(if normal_momentum >= enemy.toughness {
             ImpactBand::Destroy
         } else {
@@ -404,7 +423,7 @@ mod tests {
             vel: Vec2::ZERO,
             mass: 1.0,
             toughness,
-            touching: false,
+            spent: false,
         }
     }
 
@@ -632,14 +651,57 @@ mod tests {
             Vec2::new(50.0, 0.0),
         );
         let mut target = enemy(100.0);
-        target.touching = true;
+        target.spent = true;
         let out = resolve_contact(&hero, &target);
         assert_eq!(out.band, None);
         assert_eq!(out.toughness, 100.0);
         assert_eq!(out.hero_vel, hero.vel);
         assert!(
-            out.touching,
-            "the contact flag must hold while contact lasts"
+            out.spent,
+            "the allowance must stay spent while contact lasts"
+        );
+    }
+
+    #[test]
+    fn a_separating_tick_leaves_the_next_real_slam_able_to_register() {
+        // The flag is the one-hit-per-contact allowance and nothing else, so a
+        // tick that registered nothing must not consume it. A hero hanging on a
+        // Movable Anchor sits right at the contact boundary, because
+        // `REST_LENGTH` equals the hero's radius plus an Enemy's half extent, so
+        // the spring's outward half of a cycle reaches this every time; the
+        // inward half then has to still be able to land.
+        //
+        // Reached through a separating tick rather than by setting the flag by
+        // hand, because the value a separating tick leaves behind is the thing
+        // under test.
+        let outward = pass(
+            Vec2::new(-0.2, 0.0),
+            Vec2::new(-0.3, 0.0),
+            Vec2::new(-10.0, 0.0),
+        );
+        let first = resolve_contact(&outward, &enemy(100.0));
+        assert_eq!(first.band, None, "moving away registers nothing: {first:?}");
+        assert_eq!(first.toughness, 100.0, "nothing was spent: {first:?}");
+
+        // The very next tick, the same overlap with the hero driven in at 50
+        // units per second: a Slam, carried forward exactly as
+        // `World::resolve_impacts` carries it.
+        let inward = pass(
+            Vec2::new(-0.2, 0.0),
+            Vec2::new(0.2, 0.0),
+            Vec2::new(50.0, 0.0),
+        );
+        let mut target = enemy(100.0);
+        target.spent = first.spent;
+        let second = resolve_contact(&inward, &target);
+        assert_eq!(second.band, Some(ImpactBand::Slam), "{second:?}");
+        assert_eq!(
+            second.toughness, 50.0,
+            "the pool must take the normal momentum: {second:?}"
+        );
+        assert!(
+            second.hero_vel.x < inward.vel.x,
+            "a Slam that registered must cost the hero momentum: {second:?}"
         );
     }
 
