@@ -398,12 +398,13 @@ impl World {
             .retain(|b| !despawn::left_kill_bound(&self.kill_bound, b.pos));
 
         // And last of all, the slots. ADR-0014: a Tongue whose Movable Anchor
-        // has left the simulation forces a Release. This runs after *both* ways
-        // of losing a body, the emptied `Toughness` pool in `resolve_impacts`
-        // and the Kill Bound above, because it is the same rule either way and
-        // one sweep cannot disagree with itself. It is also why this is here
-        // rather than inside either removal: a slot is judged against the body
-        // list the tick actually ended with.
+        // has left the simulation forces a Release. This runs after *every* way
+        // of losing a body: the emptied `Toughness` pool in `resolve_impacts`,
+        // ADR-0011's Thrown matrix in `resolve_thrown`, and the Kill Bound
+        // above. It is the same rule for all three and one sweep cannot
+        // disagree with itself, which is also why this is here rather than
+        // inside any of the removals: a slot is judged against the body list
+        // the tick actually ended with.
         //
         // Nothing is spent and no impulse is applied, so the hero carries
         // exactly the momentum it had. ADR-0012 makes that the whole of a

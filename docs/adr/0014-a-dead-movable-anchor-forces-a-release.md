@@ -18,7 +18,9 @@ The precedent settles it either way. ADR-0011's Thrown matrix already frees the 
 
 ## Where in the tick it happens
 
-One sweep over the slots, after **both** ways of losing a body: the emptied `Toughness` pool in `resolve_impacts` and the Kill Bound retain. Two sweeps, one per removal, would be two places for one rule to drift, and the two removals sit at different points in the Sim Tick.
+One sweep over the slots, after **every** way of losing a body: the emptied `Toughness` pool in `resolve_impacts` and the Kill Bound retain. Two sweeps, one per removal, would be two places for one rule to drift, and the removals sit at different points in the Sim Tick.
+
+There are three of them as of ticket #18, which is the argument for one sweep arriving on schedule: ADR-0011's Thrown matrix removes bodies too, at a third point in the tick, and it needed no new slot handling at all. The sweep that was written for two removals covered the third for free, and a second copy of the rule would have had to be written and kept in step.
 
 It runs last, before the `Snapshot` is written, for the same reason the Kill Bound does: a slot is judged against the body list the tick actually ended with. It is also a mutation, so it must stay unreachable from the force evaluation that ADR-0007 runs twice per tick.
 
