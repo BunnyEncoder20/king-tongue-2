@@ -11,7 +11,8 @@ use crate::despawn;
 use crate::frame::{Body, BodyKind, Snapshot, TongueLine};
 use crate::input::{self, Claim, GestureTracker, TouchPhase, TouchSample};
 use crate::level::{Aabb, Level};
-use crate::tongue::{self, Pulls, Tongue, Tongues};
+use crate::movable_anchor::{self, Target};
+use crate::tongue::{Pulls, Tongue, Tongues};
 use crate::{
     Anchor, EntityId, DEFAULT_PLAYER_MASS, DEFAULT_PULL_STRENGTH, DT, GRAVITY, MAX_TONGUES,
     PLAYER_RADIUS,
@@ -99,6 +100,33 @@ pub struct World {
     /// interpolate without owning any history of its own.
     current: Snapshot,
     previous: Snapshot,
+    /// One Sim Tick's working state, one entry per body, kept between ticks so
+    /// that a tick allocates nothing once the run is warm. Cleared and refilled
+    /// by [`World::step`] and meaningless outside it.
+    half_step: Vec<HalfStep>,
+}
+
+/// One body between the two halves of a Sim Tick.
+///
+/// Velocity Verlet needs the first acceleration again after the position step,
+/// and a mutual force needs every body's new position before any body's second
+/// acceleration can be taken, so the tick cannot be a single pass per body.
+/// This is what the first pass leaves behind for the second.
+#[derive(Clone, Copy, Debug)]
+struct HalfStep {
+    /// Where the body ended up, after integration and terrain contact.
+    pos: Vec2,
+    /// The velocity the body began the tick with, until the second pass
+    /// overwrites it with the one the body ends the tick with.
+    ///
+    /// Two meanings in one field, deliberately: ADR-0007 evaluates the second
+    /// acceleration at the new position and the **old** velocity, so the old
+    /// one has to survive the position write, and the new one has to wait here
+    /// until every body has been evaluated so that no body reads another's new
+    /// velocity half way through the pass.
+    vel: Vec2,
+    a0: Vec2,
+    contacts: Contacts,
 }
 
 impl World {
@@ -117,6 +145,7 @@ impl World {
             tick: 0,
             current: Snapshot::default(),
             previous: Snapshot::default(),
+            half_step: Vec::with_capacity(1 + level.enemy_spawns.len()),
         };
 
         let hero = world.alloc_id();
@@ -188,6 +217,19 @@ impl World {
     /// `a(t + DT)` would need `v(t + DT)`, which is not known yet, and this is
     /// the arrangement ADR-0007's stability and drift numbers were measured in.
     /// Changing it invalidates those measurements.
+    ///
+    /// **Every body takes each evaluation before any body takes the next**, in
+    /// two passes rather than one pass per body. With only Fixed Anchors the
+    /// two arrangements are bit-identical, because nothing one body's force
+    /// reads is anything another body changed. A Tongue on a Movable Anchor
+    /// makes them differ: the hero's force depends on where the Enemy is, so a
+    /// per-body loop would hand the second body of the pair the first body's
+    /// *new* position while the first had seen the second's old one, and the
+    /// two ends of one Tongue would pull by different amounts. Two passes let
+    /// both ends be computed from one configuration, which is what makes the
+    /// mass-ratio pull in ADR-0003 exactly equal and opposite and what makes
+    /// one Tongue on terrain and one on an Enemy a single three-body system
+    /// rather than two independent pairs.
     pub fn step(&mut self) {
         // Where the hero began the tick, kept for the combat sweep below: an
         // impact is a question about the path the hero travelled and not about
@@ -198,12 +240,18 @@ impl World {
             .find(|b| b.id == self.hero)
             .map(|b| b.pos);
 
+        // Taken out of `self` rather than borrowed, so the force evaluation can
+        // keep reading every body while this is being filled. Put back at the
+        // end of the tick, so its capacity survives and a warm tick allocates
+        // nothing.
+        let mut half_step = core::mem::take(&mut self.half_step);
+        half_step.clear();
+
+        // First pass: the first of ADR-0007's two evaluations for every body,
+        // the position step, and terrain contact. Anchors are resolved here
+        // from the state the tick began in.
         for i in 0..self.bodies.len() {
             let body = self.bodies[i];
-
-            // Resolved once per body per tick, before either evaluation, and
-            // `Copy`. Both evaluations therefore see the same Anchors, and
-            // neither can reach the `World` to look one up.
             let pulls = self.pulls_on(body.id);
 
             let a0 = body_force(&body, pulls) / body.mass;
@@ -213,23 +261,49 @@ impl World {
             // keeps `body_force` pure: contact is resolved out here, once, and
             // never inside an acceleration that gets evaluated twice.
             let (pos, contacts) = sweep(body.pos, target, PLAYER_RADIUS, &self.static_terrain);
+            half_step.push(HalfStep {
+                pos,
+                vel: body.vel,
+                a0,
+                contacts,
+            });
+        }
 
-            // The second of the two evaluations ADR-0007 pays for. It probes a
-            // hypothetical state rather than the live body, which is why
-            // `body_force` takes a state by value and can touch nothing else.
-            let mut probe = body;
-            probe.pos = pos;
-            let a1 = body_force(&probe, pulls) / body.mass;
+        // The new positions are published between the passes. Velocities are
+        // deliberately left alone: ADR-0007's second evaluation wants the new
+        // position and the old velocity, and leaving `vel` untouched is what
+        // supplies that without carrying a second copy of it around.
+        for (body, step) in self.bodies.iter_mut().zip(half_step.iter()) {
+            body.pos = step.pos;
+        }
+
+        // Second pass: the second evaluation, against the configuration every
+        // body is now in, and the velocity step.
+        //
+        // The new velocities are parked in `half_step` and published only once
+        // every body has been evaluated. Writing them straight back would let a
+        // body evaluated later in the pass read a counterpart's *new* velocity
+        // while the counterpart had read its old one, and the damping term on
+        // the two ends of one Tongue would then disagree by `damping` times the
+        // tick's whole change in closing speed. That was measured: a 3 unit
+        // Enemy 10 units out gained 0.149 of momentum from nowhere on the first
+        // tick alone, growing every tick after it.
+        for (body, step) in self.bodies.iter().zip(half_step.iter_mut()) {
+            let a1 = body_force(body, self.pulls_on(body.id)) / body.mass;
 
             // Cancelling after the velocity half-step and not before is
             // load-bearing: the half-step adds another tick of gravity, and
             // leaving that in would let a resting body build downward speed
             // against the floor and eventually creep through it.
-            let vel = contacts.cancel_into_surfaces(body.vel + 0.5 * (a0 + a1) * DT);
-
-            self.bodies[i].pos = pos;
-            self.bodies[i].vel = vel;
+            step.vel = step
+                .contacts
+                .cancel_into_surfaces(step.vel + 0.5 * (step.a0 + a1) * DT);
         }
+        for (body, step) in self.bodies.iter_mut().zip(half_step.iter()) {
+            body.vel = step.vel;
+        }
+
+        self.half_step = half_step;
 
         // Impacts are impulses and not forces, so they are resolved here, once,
         // after the integration step. Putting any of this inside `body_force`
@@ -247,6 +321,21 @@ impl World {
         // the `Snapshot`, which is all the Shell ever needs to know about it.
         self.bodies
             .retain(|b| !despawn::left_kill_bound(&self.kill_bound, b.pos));
+
+        // And last of all, the slots. ADR-0014: a Tongue whose Movable Anchor
+        // has left the simulation forces a Release. This runs after *both* ways
+        // of losing a body, the emptied `Toughness` pool in `resolve_impacts`
+        // and the Kill Bound above, because it is the same rule either way and
+        // one sweep cannot disagree with itself. It is also why this is here
+        // rather than inside either removal: a slot is judged against the body
+        // list the tick actually ended with.
+        //
+        // Nothing is spent and no impulse is applied, so the hero carries
+        // exactly the momentum it had. ADR-0012 makes that the whole of a
+        // Release.
+        movable_anchor::release_dead_anchors(&mut self.tongues, |id| {
+            self.bodies.iter().any(|b| b.id == id)
+        });
 
         self.tick += 1;
         // Rotate before writing, so `previous` is the tick before `current` and
@@ -324,20 +413,40 @@ impl World {
     /// Fires a Tongue from the hero toward `tapped`, if the ray meets anything.
     ///
     /// The Gesture's direction is the vector from the hero to the tapped point,
-    /// and the ray goes exactly along it. ADR-0012: the aim is never bent.
+    /// and the ray goes exactly along it. ADR-0012: the aim is never bent, and
+    /// the Enemy Assist Arc in [`movable_anchor::cast_anchor`] changes which
+    /// body is preferred and never the direction.
     fn fire(&mut self, slot: u8, tapped: Vec2) {
         let Some(hero) = self.body(self.hero) else {
             return;
         };
         let from = hero.pos;
+        // Borrowed as an iterator rather than collected, so a tap allocates
+        // nothing. Only `Enemy` bodies are targets: the hero cannot Attach to
+        // itself, and ADR-0011's `Thrown` state has nothing that produces it
+        // yet, so whether a Thrown Enemy is grappable is a later ticket's
+        // decision and not one to guess at here.
+        let targets = self
+            .bodies
+            .iter()
+            .filter(|b| b.kind == BodyKind::Enemy)
+            .map(|b| Target {
+                id: b.id,
+                // The exact centre of mass, which ADR-0012 allows no
+                // alternative to: a surface attachment would put the spring
+                // force off the line between the two centres and so imply a
+                // torque that bodies with no angular dynamics cannot carry.
+                centre: b.pos,
+                half_extents: combat::ENEMY_HALF_EXTENTS,
+            });
         // A ray into open sky meets nothing and fires nothing. ADR-0012 says a
         // fired Tongue always connects, which holds for an enclosed level; a
         // sketch with open sky is a test fixture, and the honest answer there is
         // that the slot stays empty rather than an Anchor being invented.
-        if let Some(point) = tongue::cast(from, tapped - from, &self.static_terrain) {
-            self.tongues[slot as usize] = Some(Tongue {
-                anchor: Anchor::Fixed(point),
-            });
+        if let Some(anchor) =
+            movable_anchor::cast_anchor(from, tapped - from, &self.static_terrain, targets)
+        {
+            self.tongues[slot as usize] = Some(Tongue { anchor });
         }
     }
 
@@ -357,33 +466,67 @@ impl World {
 
     /// Every Tongue pulling on one body this Sim Tick, with its Anchor resolved
     /// to a world-space point.
+    /// Every Tongue pulling on one body this Sim Tick, with its Anchor resolved
+    /// to a world-space point and that point's own velocity.
+    ///
+    /// Only the hero holds Tongues, but a Tongue has two ends. The hero feels
+    /// one pull per Attached slot; a body serving as a Movable Anchor feels the
+    /// reaction, which ADR-0003 makes the mass-ratio pull: the same force, the
+    /// other way round, divided by its own mass rather than the hero's.
+    ///
+    /// The reaction is a **force** and not an impulse, which is why it is here
+    /// and not beside the impacts. ADR-0007's integrator evaluates this twice
+    /// per Sim Tick, and anything applied here once per tick would be applied
+    /// twice.
     fn pulls_on(&self, body: EntityId) -> Pulls {
         let mut pulls = Pulls::default();
-        // Only the hero holds Tongues. The equal and opposite pull a Movable
-        // Anchor feels by mass ratio is ADR-0003's and arrives with the Enemy
-        // Anchor ticket; it will add to this, not replace it.
-        if body != self.hero {
+        if body == self.hero {
+            for tongue in self.tongues.iter().flatten() {
+                if let Some((point, vel)) = self.anchor_state(tongue.anchor) {
+                    pulls.push_moving(point, vel, self.hero_pull_strength);
+                }
+            }
             return pulls;
         }
+
+        let Some(hero) = self.body(self.hero) else {
+            return pulls;
+        };
+        // The hero's `k` and not the Enemy's: Hooke's constant belongs to the
+        // Tongue, and so to the hero who fired it. An Enemy has none of its
+        // own. The ceiling is applied per pull, so an Enemy held by both slots
+        // can feel up to `MAX_TONGUES * DEFAULT_FORCE_CEILING`, the same bound
+        // ADR-0003 records for the hero and for the same reason.
         for tongue in self.tongues.iter().flatten() {
-            if let Some(point) = self.anchor_point(tongue.anchor) {
-                pulls.push(point, self.hero_pull_strength);
+            if tongue.anchor == Anchor::Movable(body) {
+                pulls.push_moving(hero.pos, hero.vel, self.hero_pull_strength);
             }
         }
         pulls
     }
 
-    /// Where an Anchor is right now.
-    fn anchor_point(&self, anchor: Anchor) -> Option<Vec2> {
+    /// Where an Anchor is right now, and how fast it is moving.
+    ///
+    /// The velocity is half the answer rather than an extra: the damping term
+    /// is taken against the relative radial velocity, so a Tongue on a moving
+    /// Enemy that read the hero's velocity alone would pull the two ends by
+    /// different amounts and the pair would gain momentum out of nothing. A
+    /// Fixed Anchor reports zero, which is simply true of terrain.
+    fn anchor_state(&self, anchor: Anchor) -> Option<(Vec2, Vec2)> {
         match anchor {
-            Anchor::Fixed(point) => Some(point),
+            Anchor::Fixed(point) => Some((point, Vec2::ZERO)),
             // Resolved by identity and never by slice position, so a spawn or a
             // despawn elsewhere cannot silently re-point a Tongue. A body that
             // has despawned resolves to nothing rather than to a stale
-            // position. Nothing fires at an Enemy yet: this ticket's ray cast
-            // tests `static_terrain` only.
-            Anchor::Movable(id) => self.body(id).map(|b| b.pos),
+            // position, which is what makes the force and the drawn line vanish
+            // with it; ADR-0014 adds the slot.
+            Anchor::Movable(id) => self.body(id).map(|b| (b.pos, b.vel)),
         }
+    }
+
+    /// Where an Anchor is right now, for the line the Shell draws.
+    fn anchor_point(&self, anchor: Anchor) -> Option<Vec2> {
+        self.anchor_state(anchor).map(|(point, _)| point)
     }
 
     fn body(&self, id: EntityId) -> Option<&BodyState> {
@@ -767,6 +910,7 @@ fn write_snapshot(
 mod tests {
     use super::*;
 
+    use crate::tongue;
     use crate::{DEFAULT_DAMPING, DEFAULT_FORCE_CEILING, REST_LENGTH};
 
     /// The hero as the seam exposes it: looked up by identity, never by slice

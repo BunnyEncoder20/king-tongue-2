@@ -24,15 +24,25 @@ pub struct Tongue {
 /// The hero's Tongue slots. At most two, per ADR-0006.
 pub type Tongues = [Option<Tongue>; MAX_TONGUES];
 
-/// One Tongue's pull on a body: where it drags toward, and how hard.
+/// One Tongue's pull on a body: where it drags toward, how fast that point is
+/// itself moving, and how hard.
 ///
 /// `strength` travels with the point rather than being read off the body being
 /// pulled, because Hooke's `k` is a property of the Tongue and so of the hero
-/// who fired it. When a Tongue on a Movable Anchor starts pulling an Enemy by
-/// mass ratio, the Enemy feels the hero's `k` and has none of its own.
+/// who fired it. A Tongue on a Movable Anchor pulls the Enemy by mass ratio, so
+/// the Enemy feels the hero's `k` and has none of its own.
+///
+/// `vel` is the Anchor's own velocity, zero for a Fixed Anchor and the Enemy's
+/// velocity for a Movable one. It exists so the damping term can be taken
+/// against the **relative** radial velocity, which ADR-0011 names directly and
+/// Newton's third law requires: damping against each body's absolute velocity
+/// would give the two ends of one Tongue forces of different magnitude, and the
+/// pair would gain or lose momentum out of nothing. For a Fixed Anchor the two
+/// readings are the same number, because terrain does not move.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pull {
     pub point: Vec2,
+    pub vel: Vec2,
     pub strength: f32,
 }
 
@@ -50,9 +60,19 @@ pub struct Pulls {
 }
 
 impl Pulls {
+    /// Adds a pull toward a point that does not move. Terrain, in other words.
     pub fn push(&mut self, point: Vec2, strength: f32) {
+        self.push_moving(point, Vec2::ZERO, strength);
+    }
+
+    /// Adds a pull toward a point that is itself a moving body.
+    pub fn push_moving(&mut self, point: Vec2, anchor_vel: Vec2, strength: f32) {
         if self.count < MAX_TONGUES {
-            self.pulls[self.count] = Some(Pull { point, strength });
+            self.pulls[self.count] = Some(Pull {
+                point,
+                vel: anchor_vel,
+                strength,
+            });
             self.count += 1;
         }
     }
@@ -67,22 +87,29 @@ impl Pulls {
         self.pulls
             .iter()
             .flatten()
-            .map(|p| pull(pos, vel, p.point, p.strength))
+            .map(|p| pull(pos, vel - p.vel, p.point, p.strength))
             .sum()
     }
 }
 
-/// The force one Attached Tongue applies to a body at `pos` moving at `vel`.
+/// The force one Attached Tongue applies to a body at `pos` closing on its
+/// Anchor at `relative_vel`.
 ///
 /// A thin wrapper that supplies the damping and ceiling the #8 prototype
 /// measured, so no caller invents its own. Pure, which ADR-0007 makes a hard
 /// requirement rather than a preference: Velocity Verlet evaluates acceleration
 /// twice per Sim Tick, so anything with a side effect here would be applied
 /// twice and the simulation would be quietly wrong.
-pub fn pull(pos: Vec2, vel: Vec2, anchor_point: Vec2, pull_strength: f32) -> Vec2 {
+///
+/// `relative_vel` is the body's velocity **minus the Anchor's**. For a Fixed
+/// Anchor that is the body's own velocity, which is why every measurement taken
+/// against terrain still means what it did. For a Movable Anchor it is what
+/// makes the two ends of one Tongue feel forces that are exact negations of
+/// each other.
+pub fn pull(pos: Vec2, relative_vel: Vec2, anchor_point: Vec2, pull_strength: f32) -> Vec2 {
     crate::tongue_force(
         pos,
-        vel,
+        relative_vel,
         anchor_point,
         pull_strength,
         DEFAULT_DAMPING,
