@@ -6,7 +6,7 @@
 //! fixed Sim Tick, ADR-0007 for the integrator, and ADR-0009 for the two
 //! snapshots this type retains.
 
-use crate::combat;
+use crate::combat::{self, ENEMY_HALF_EXTENTS};
 use crate::combo::{Combo, HeroState};
 use crate::despawn;
 use crate::frame::{Body, BodyKind, Snapshot, TongueLine};
@@ -3451,6 +3451,157 @@ mod tests {
         /// of a standstill.
         fn tension_at_rest(world: &World, distance: f32, mass: f32) -> f32 {
             world.hero_pull_strength() * (distance - REST_LENGTH) / mass
+        }
+
+        /// One long floor with the hero on it and one Enemy `distance` units
+        /// along it, both resting exactly on the surface.
+        ///
+        /// The Tongue is horizontal, so the pull drags the Enemy **along** the
+        /// terrain it is already touching. That is the only geometry that can
+        /// reach ADR-0011's terrain row at all: the pull is always toward the
+        /// hero, so a surface between the two bodies would block the tap under
+        /// ADR-0012 and the Enemy would never be Attached in the first place.
+        ///
+        /// Both bodies rest at exactly `floor_top + PLAYER_RADIUS`, where the
+        /// swept test reports a zero-depth contact rather than a crossing, so
+        /// the contact is genuine and continuous from the first tick.
+        fn shared_floor(distance: f32, enemy_mass: f32) -> Level {
+            let level = Level {
+                world_bounds: Aabb::new(Vec2::new(0.0, 0.0), Vec2::splat(500.0)),
+                static_terrain: vec![Aabb::new(
+                    Vec2::new(distance * 0.5, -1.0),
+                    Vec2::new(60.0, 1.0),
+                )],
+                player_spawn: Vec2::new(0.0, PLAYER_RADIUS),
+                enemy_spawns: vec![EnemySpawn {
+                    pos: Vec2::new(distance, PLAYER_RADIUS),
+                    toughness: 100_000.0,
+                    mass: enemy_mass,
+                }],
+            };
+            level.validate().expect("fixture must be a valid level");
+            level
+        }
+
+        /// Far enough that the Tongue genuinely Throws a baseline Enemy, and
+        /// the figure every assertion in the terrain pair is sized against:
+        /// `DEFAULT_PULL_STRENGTH * (14 - REST_LENGTH)` is 520, which is a mass
+        /// 1 Enemy's tension and half of a mass 2 Enemy's.
+        const THROW_DISTANCE: f32 = 14.0;
+
+        #[test]
+        fn a_thrown_enemy_in_contact_with_terrain_is_destroyed() {
+            // ADR-0011's first inverted row, and the whole reason the state is
+            // high risk: "any terrain contact ends it", so using an Enemy as a
+            // weapon demands real control rather than being free damage.
+            //
+            // The mutation of this test is
+            // `a_tracking_enemy_slides_along_terrain_and_is_never_destroyed`,
+            // which is the same scene with the Enemy's mass doubled and so the
+            // tension halved. Nothing else differs between the two.
+            let mut world = World::from_level(&shared_floor(THROW_DISTANCE, 1.0));
+            let enemy = enemy_of(&world);
+
+            tap(&mut world, 1, Vec2::new(THROW_DISTANCE, PLAYER_RADIUS));
+            world.step();
+
+            // One tick of environmental immunity, which is not an accident: the
+            // tension is read at the configuration the tick began in, and
+            // through the whole of that tick's motion the body was still below
+            // the threshold and still immune. Promoting before resolving the
+            // matrix would destroy it against the very surface it was immune to
+            // while being pulled along it.
+            assert_eq!(
+                kind_of(&world, enemy),
+                Some(BodyKind::Thrown),
+                "the pull must Throw the Enemy on the tick its tension exceeded the threshold"
+            );
+
+            world.step();
+            assert_eq!(
+                kind_of(&world, enemy),
+                None,
+                "a Thrown Enemy in contact with terrain must be destroyed"
+            );
+            // And the slot went with it. ADR-0014 frees a slot whenever its
+            // Movable Anchor leaves the simulation, by either route, and cites
+            // this matrix as the precedent it generalised.
+            assert!(
+                world.snapshot().tongues.is_empty(),
+                "a destroyed Anchor must free its slot: {:?}",
+                world.snapshot().tongues
+            );
+        }
+
+        #[test]
+        fn a_tracking_enemy_slides_along_terrain_and_is_never_destroyed() {
+            // The AC's environmental immunity, and the mutation of
+            // `a_thrown_enemy_in_contact_with_terrain_is_destroyed`: the same
+            // scene with the Enemy twice as heavy, so the tension is 260
+            // against the same 500 threshold. Below it, sliding into terrain
+            // does nothing but bounding-box slide physics.
+            const MASS: f32 = 2.0;
+            // The pair closes under a relative acceleration of roughly 780, so
+            // the 13 unit gap takes about 12 ticks. Eight is the whole window
+            // before they meet, and the guard below asserts that rather than
+            // assuming it: an impact would bring `combat` into a measurement
+            // that was about terrain.
+            const CLEAN_TICKS: u32 = 8;
+            let mut world = World::from_level(&shared_floor(THROW_DISTANCE, MASS));
+            let enemy = enemy_of(&world);
+            let tension = tension_at_rest(&world, THROW_DISTANCE, MASS);
+            assert!(
+                tension < thrown::THROW_TENSION,
+                "the fixture must stay inside the tracking band, got {tension}"
+            );
+
+            tap(&mut world, 1, Vec2::new(THROW_DISTANCE, PLAYER_RADIUS));
+            world.step();
+
+            // The first tick out of a standstill, where the damping term is
+            // identically zero, so the displacement is the analytic one:
+            // Velocity Verlet's position step with `vel` zero is `0.5 a DT^2`.
+            // Horizontal only, and that is the substance of "nothing but slide
+            // physics": terrain took the part of the motion heading into the
+            // surface and left the part running along it untouched, so the
+            // along-surface displacement is exactly what it would have been in
+            // open space.
+            let first = world.snapshot().body(enemy).expect("alive").pos;
+            let expected = -0.5 * (tension) * DT * DT;
+            assert!(
+                (first.x - (THROW_DISTANCE + expected)).abs() <= 1e-4 * expected.abs(),
+                "the Enemy slid {} against the analytic {expected}",
+                first.x - THROW_DISTANCE
+            );
+
+            for _ in 1..CLEAN_TICKS {
+                world.step();
+            }
+            let end = world.snapshot().body(enemy).expect("alive").pos;
+            assert_eq!(
+                kind_of(&world, enemy),
+                Some(BodyKind::Enemy),
+                "a tension of {tension} must leave the Enemy a target"
+            );
+            // Pinned to the surface throughout. A body that had left the floor
+            // would have fallen 0.0144 units over this window under moon
+            // gravity, which is two orders of magnitude outside this bound, so
+            // the contact really was continuous and this test really did
+            // measure a body against terrain.
+            assert!(
+                (end.y - PLAYER_RADIUS).abs() < 1e-6,
+                "the Enemy left the floor it was sliding along: {end:?}"
+            );
+            assert!(
+                end.x < THROW_DISTANCE - 1.0,
+                "the Enemy barely slid at all, so nothing was measured: {end:?}"
+            );
+            // And the two never met, so nothing above is combat's doing.
+            let hero_x = hero(&world).pos.x;
+            assert!(
+                end.x - hero_x > 2.0 * PLAYER_RADIUS + ENEMY_HALF_EXTENTS.x,
+                "the bodies met inside the window: hero at {hero_x}, Enemy at {end:?}"
+            );
         }
 
         #[test]
