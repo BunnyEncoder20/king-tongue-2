@@ -425,6 +425,24 @@ mod tests {
             on_hero.length() > 1.0,
             "the fixture's Tongue pulls almost nothing: {on_hero:?}"
         );
+
+        // And it still holds once the ceiling bites, which is worth asserting
+        // rather than inferring: the clamp is applied to each end separately,
+        // so it is one more place the two could have diverged. ADR-0003 makes
+        // the ceiling per Tongue, so the Enemy's reaction is drawn from the
+        // same budget the hero's pull is.
+        let far = Vec2::new(2_000.0, 0.0);
+        let clamped_hero = pull(Vec2::ZERO, Vec2::ZERO, far, 40.0);
+        let clamped_enemy = pull(far, Vec2::ZERO, Vec2::ZERO, 40.0);
+        assert!(
+            (clamped_hero.length() - DEFAULT_FORCE_CEILING).abs() < 1e-3,
+            "the fixture must reach the ceiling, got {clamped_hero:?}"
+        );
+        assert_eq!(
+            clamped_hero + clamped_enemy,
+            Vec2::ZERO,
+            "a clamped Tongue pulls its two ends by different amounts"
+        );
     }
 
     #[test]
