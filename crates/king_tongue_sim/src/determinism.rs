@@ -1613,6 +1613,16 @@ mod tests {
         level: Level,
         ticks: u32,
         script: Script,
+        /// Ticks on which the script calls [`World::place`].
+        ///
+        /// Load-bearing for the energy budget and for nothing else. `place` is
+        /// test scaffolding that assigns a velocity from outside the
+        /// simulation, which is an injection of kinetic energy no physical
+        /// bound can account for, so the budget re-baselines on exactly these
+        /// ticks. Naming them is the honest alternative to a tolerance wide
+        /// enough to swallow them, which would also swallow the defect the
+        /// budget exists to catch.
+        injections: &'static [u64],
     }
 
     fn runs() -> Vec<Run> {
@@ -1622,72 +1632,84 @@ mod tests {
                 level: scene(),
                 ticks: 300,
                 script: no_input,
+                injections: &[],
             },
             Run {
                 name: "slam_run",
                 level: combat_scene(),
                 ticks: 300,
                 script: slam_run,
+                injections: &[0],
             },
             Run {
                 name: "combo_run",
                 level: combo_scene(),
                 ticks: 300,
                 script: combo_run,
+                injections: &[0],
             },
             Run {
                 name: "kill_bound_run",
                 level: kill_bound_scene(),
                 ticks: 300,
                 script: kill_bound_run,
+                injections: &[0],
             },
             Run {
                 name: "fires_two_tongues",
                 level: enclosed_scene(),
                 ticks: 300,
                 script: fires_two_tongues,
+                injections: &[],
             },
             Run {
                 name: "releases_mid_swing",
                 level: enclosed_scene(),
                 ticks: 300,
                 script: releases_mid_swing,
+                injections: &[],
             },
             Run {
                 name: "braces_between_two_anchors",
                 level: enclosed_scene(),
                 ticks: 300,
                 script: braces_between_two_anchors,
+                injections: &[],
             },
             Run {
                 name: "hammers_three_fingers",
                 level: enclosed_scene(),
                 ticks: 300,
                 script: hammers_three_fingers,
+                injections: &[],
             },
             Run {
                 name: "swings_on_an_enemy",
                 level: enemy_overhead_scene(),
                 ticks: 300,
                 script: swings_on_an_enemy,
+                injections: &[60],
             },
             Run {
                 name: "throws_an_enemy",
                 level: throw_scene(),
                 ticks: 300,
                 script: throws_an_enemy,
+                injections: &[],
             },
             Run {
                 name: "throws_an_enemy_into_another",
                 level: throw_and_strike_scene(),
                 ticks: 300,
                 script: throws_an_enemy_into_another,
+                injections: &[12],
             },
             Run {
                 name: "every_mechanic",
                 level: everything_scene(),
                 ticks: MINUTE,
                 script: every_mechanic,
+                injections: &[55],
             },
         ]
     }
@@ -1845,6 +1867,233 @@ mod tests {
             }
         }
         (most as f32 * k, lightest)
+    }
+
+    /// The exact potential energy stored in a Tongue Stretched by `stretch`.
+    ///
+    /// Piecewise, because the force is. ADR-0003's spring is `k * stretch`
+    /// until the force ceiling binds and the ceiling after that, so the
+    /// potential is the integral of both pieces:
+    ///
+    /// ```text
+    /// s <= F/k -> 0.5 * k * s^2
+    /// s >  F/k -> 0.5 * F^2 / k + F * (s - F/k)
+    /// ```
+    ///
+    /// The simpler `0.5 * k * s^2` that ticket #13's Swing test uses is correct
+    /// there and wrong here, and the difference is not cosmetic: that test
+    /// states its Stretch never reaches the ceiling, while a hero in a room
+    /// thirty-four units wide can be Stretched past it. Beyond the ceiling the
+    /// quadratic form grows faster than the force can do work, so a body being
+    /// pulled *away* from its Anchor would appear to gain energy out of
+    /// nothing, and the budget below would report a violation that is an
+    /// artifact of its own formula.
+    fn spring_potential(stretch: f32, k: f32) -> f32 {
+        let corner = crate::DEFAULT_FORCE_CEILING / k;
+        if stretch <= corner {
+            0.5 * k * stretch * stretch
+        } else {
+            0.5 * k * corner * corner + crate::DEFAULT_FORCE_CEILING * (stretch - corner)
+        }
+    }
+
+    /// Total mechanical energy: kinetic plus gravitational plus the Tongues'
+    /// stored potential, over every body still in the simulation.
+    ///
+    /// Velocity comes from [`World::body_velocity`] rather than from two
+    /// snapshot positions, deliberately. Differencing positions would fold the
+    /// integrator's own discretisation into the number being checked, so a
+    /// drifting integrator would partly hide inside the measurement of its own
+    /// drift.
+    fn mechanical_energy(world: &World, k: f32, mass: f32) -> f32 {
+        let snapshot = world.snapshot();
+        let mut total = 0.0;
+        for body in &snapshot.bodies {
+            let vel = world.body_velocity(body.id).unwrap_or_default();
+            total +=
+                0.5 * mass * vel.length_squared() + mass * crate::GRAVITY.length() * body.pos.y;
+        }
+        for tongue in &snapshot.tongues {
+            let stretch = ((tongue.to - tongue.from).length() - crate::REST_LENGTH).max(0.0);
+            total += spring_potential(stretch, k);
+        }
+        total
+    }
+
+    /// What a `Snapshot` says about the discrete state of the run: which bodies
+    /// exist and what each slot is Attached to.
+    ///
+    /// The energy budget re-baselines whenever this changes, and the list is
+    /// exactly the set of events that can legitimately *raise* the total.
+    /// Attaching a Stretched Tongue creates stored potential out of nothing,
+    /// which is the Core Sim's only energy source; losing a body takes its
+    /// energy out of the sum. Everything else, impacts included, can only
+    /// spend: ADR-0011's Kick is an elastic exchange between equal masses, a
+    /// Slam hands the Enemy the momentum it takes off the hero, the Thrown
+    /// plough damps, and terrain contact cancels velocity into the surface.
+    fn discrete_state(snapshot: &Snapshot) -> (Vec<crate::EntityId>, Vec<(u8, Anchor)>) {
+        (
+            snapshot.bodies.iter().map(|b| b.id).collect(),
+            snapshot
+                .tongues
+                .iter()
+                .map(|t| (t.slot, t.anchor))
+                .collect(),
+        )
+    }
+
+    /// Walks a run and reports the first tick on which total mechanical energy
+    /// rose by more than `tolerance` with no discrete event to pay for it.
+    ///
+    /// Returns the worst ratio seen as well, so a caller can say whether the
+    /// bound is tight or merely generous.
+    fn energy_violation(run: &Run, tolerance: f32) -> (Option<String>, f32) {
+        let mut world = World::from_level(&run.level);
+        let k = world.hero_pull_strength();
+        // One mass for the whole scene, asserted rather than assumed. Mapping
+        // an `EntityId` back to a spawn would depend on the order
+        // `World::from_level` allocates ids in, which is an implementation
+        // detail the `Snapshot` seam deliberately does not expose; every
+        // sketched Enemy has the baseline mass, so there is nothing to map.
+        let mass = crate::DEFAULT_PLAYER_MASS;
+        assert!(
+            run.level.enemy_spawns.iter().all(|s| s.mass == mass),
+            "{}: this budget assumes one mass for the scene",
+            run.name
+        );
+
+        let mut budget = mechanical_energy(&world, k, mass);
+        let mut state = discrete_state(world.snapshot());
+        let mut worst = 0.0f32;
+        for _ in 0..run.ticks {
+            let tick = world.snapshot().tick;
+            (run.script)(tick, &mut world);
+            world.step();
+            let energy = mechanical_energy(&world, k, mass);
+            let now = discrete_state(world.snapshot());
+            if now != state || run.injections.contains(&tick) {
+                // A discrete event paid for whatever changed, so the budget is
+                // re-taken here rather than carried forward. Carrying it
+                // forward is what makes a cumulative budget over-permissive:
+                // every Attach would raise it for the rest of the run and the
+                // bound would end up hundreds of times the energy in the
+                // simulation.
+                budget = energy;
+            } else {
+                worst = worst.max(energy / budget.max(f32::MIN_POSITIVE));
+                if energy > budget * (1.0 + tolerance) {
+                    return (
+                        Some(format!(
+                            "{}: tick {tick} raised total energy to {energy} against \
+                             a budget of {budget}, with no Attach, no death and no \
+                             placement to pay for it",
+                            run.name
+                        )),
+                        worst,
+                    );
+                }
+            }
+            state = now;
+        }
+        (None, worst)
+    }
+
+    /// `every_mechanic`, plus a shove nobody paid for.
+    ///
+    /// The mutation that proves the budget can fail. Tick 1000 is in the middle
+    /// of a quiet stretch of the repeating phase, with no Attach, no Release
+    /// and no death anywhere near it, so the extra speed has nothing to hide
+    /// behind. Registered with no injection tick, because the point is that an
+    /// unaccounted injection is caught.
+    fn injects_energy_from_nowhere(tick: u64, world: &mut World) {
+        every_mechanic(tick, world);
+        if tick != 1_000 {
+            return;
+        }
+        let hero = world.hero_id();
+        let pos = world.snapshot().body(hero).map(|b| b.pos);
+        let vel = world.body_velocity(hero);
+        if let (Some(pos), Some(vel)) = (pos, vel) {
+            world.place(hero, pos, vel + Vec2::new(5.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn total_mechanical_energy_stays_bounded_over_a_long_run() {
+        // The AC asks for a long run with every mechanic active, Tongues on
+        // Movable Anchors and Thrown collisions included, and that is
+        // `every_mechanic` for a full minute. Every other registered run is
+        // checked by the same walk, because the claim is about the simulation
+        // and not about one script.
+        //
+        // The bound is per stretch of continuous simulation rather than
+        // cumulative, and that is the part worth reading twice. Energy in this
+        // Core Sim has exactly one source, an Attach, which stores
+        // `0.5 * k * s^2` the instant a Stretched Tongue connects: a tap at
+        // twenty units puts 8,000 units of potential into a world that had a
+        // few dozen. A budget that added each of those and never gave them
+        // back would, by the end of a minute, be a hundred times the energy
+        // actually in the simulation, and would pass through anything. So the
+        // budget is re-taken at every discrete event and held flat in between,
+        // which makes the claim the physical one: between two events, this
+        // simulation can only *spend*.
+        // A hundredth of a percent, which was chosen after measuring rather
+        // than before. The worst continuous stretch anywhere in the registry
+        // gains 6e-7 of its budget, so this is sixteen times the measurement
+        // and not a thousand times it. The first draft allowed a tenth of a
+        // percent, which is 1,600 times the drift the simulation actually has
+        // and would have passed a real defect of that size without comment.
+        const TOLERANCE: f32 = 1e-5;
+        let mut worst = 0.0f32;
+        for run in runs() {
+            let (violation, seen) = energy_violation(&run, TOLERANCE);
+            assert!(violation.is_none(), "{}", violation.unwrap_or_default());
+            worst = worst.max(seen);
+        }
+        // And energy really does drift, by a little, which is what says the
+        // walk is measuring something. A run whose every ratio came out as
+        // exactly 1.0 would more likely mean the energy was being read as a
+        // constant than that Velocity Verlet is exact.
+        assert!(
+            worst > 1.0,
+            "no run showed any drift at all, so this is measuring a constant: \
+             worst ratio {worst}"
+        );
+    }
+
+    #[test]
+    fn the_energy_budget_catches_energy_that_came_from_nowhere() {
+        // The mutation check, because "nothing grew" is the easiest claim in
+        // testing to make vacuously. The same walk over the same scene and the
+        // same script, with one shove added in a quiet stretch, has to report
+        // it. Without this the budget could be measuring the wrong quantity
+        // entirely and would still be green on every run above.
+        let sabotaged = Run {
+            name: "injects_energy_from_nowhere",
+            level: everything_scene(),
+            ticks: MINUTE,
+            script: injects_energy_from_nowhere,
+            injections: &[],
+        };
+        let (violation, _) = energy_violation(&sabotaged, 1e-5);
+        let message = violation.expect("an unpaid-for shove must be reported");
+        assert!(
+            message.contains("tick 1000"),
+            "the violation must be reported on the tick it happened: {message}"
+        );
+
+        // And the same run with that tick declared as an injection passes,
+        // which is what shows the walk is reporting the shove rather than
+        // something else about the scene.
+        let declared = Run {
+            name: "injects_energy_from_nowhere",
+            level: everything_scene(),
+            ticks: MINUTE,
+            script: injects_energy_from_nowhere,
+            injections: &[1_000],
+        };
+        let (violation, _) = energy_violation(&declared, 1e-5);
+        assert!(violation.is_none(), "{}", violation.unwrap_or_default());
     }
 
     #[test]
