@@ -321,7 +321,14 @@ impl World {
         // deliberately left alone: ADR-0007's second evaluation wants the new
         // position and the old velocity, and leaving `vel` untouched is what
         // supplies that without carrying a second copy of it around.
+        // Zipped by position, which is correct here and fragile in general.
+        // `HalfStep` carries an `id` because index alignment stops holding the
+        // moment `resolve_impacts` shortens the body list; all three of this
+        // tick's zips sit inside the integration loop, which runs before any
+        // removal, so position and identity still agree. The assertion says so
+        // out loud rather than leaving the next reader to re-derive it.
         for (body, step) in self.bodies.iter_mut().zip(half_step.iter()) {
+            debug_assert_eq!(body.id, step.id);
             body.pos = step.pos;
         }
 
@@ -336,7 +343,14 @@ impl World {
         // tick's whole change in closing speed. That was measured: a 3 unit
         // Enemy 10 units out gained 0.149 of momentum from nowhere on the first
         // tick alone, growing every tick after it.
+        // Zipped by position, which is correct here and fragile in general.
+        // `HalfStep` carries an `id` because index alignment stops holding the
+        // moment `resolve_impacts` shortens the body list; all three of this
+        // tick's zips sit inside the integration loop, which runs before any
+        // removal, so position and identity still agree. The assertion says so
+        // out loud rather than leaving the next reader to re-derive it.
         for (body, step) in self.bodies.iter().zip(half_step.iter_mut()) {
+            debug_assert_eq!(body.id, step.id);
             let a1 = body_force(body, self.pulls_on(body.id)) / body.mass;
 
             // Cancelling after the velocity half-step and not before is
@@ -347,7 +361,14 @@ impl World {
                 .contacts
                 .cancel_into_surfaces(step.vel + 0.5 * (step.a0 + a1) * DT);
         }
+        // Zipped by position, which is correct here and fragile in general.
+        // `HalfStep` carries an `id` because index alignment stops holding the
+        // moment `resolve_impacts` shortens the body list; all three of this
+        // tick's zips sit inside the integration loop, which runs before any
+        // removal, so position and identity still agree. The assertion says so
+        // out loud rather than leaving the next reader to re-derive it.
         for (body, step) in self.bodies.iter_mut().zip(half_step.iter()) {
+            debug_assert_eq!(body.id, step.id);
             body.vel = step.vel;
         }
 
@@ -559,8 +580,6 @@ impl World {
         self.tongues[slot as usize] = None;
     }
 
-    /// Every Tongue pulling on one body this Sim Tick, with its Anchor resolved
-    /// to a world-space point.
     /// Every Tongue pulling on one body this Sim Tick, with its Anchor resolved
     /// to a world-space point and that point's own velocity.
     ///
@@ -1010,26 +1029,12 @@ fn depenetrate(pos: Vec2, radius: f32, terrain: &[Aabb]) -> Option<(Vec2, Vec2)>
             // The centre is inside the box, so there is no outward direction to
             // read off the geometry. Leave through the nearest face, which is
             // the shortest way out and the only choice that does not teleport
-            // the body across the level.
-            let to_min = pos - aabb.min();
-            let to_max = aabb.max() - pos;
-            let faces = [
-                (to_min.x, Vec2::NEG_X),
-                (to_max.x, Vec2::X),
-                (to_min.y, Vec2::NEG_Y),
-                (to_max.y, Vec2::Y),
-            ];
-            let (dist, normal) =
-                faces
-                    .iter()
-                    .copied()
-                    .fold((f32::INFINITY, Vec2::Y), |best, face| {
-                        if face.0 < best.0 {
-                            face
-                        } else {
-                            best
-                        }
-                    });
+            // the body across the level. Shared with
+            // `combat::surface_normal`, which needed the identical fold and the
+            // identical face: see [`Aabb::nearest_face`]. The depth is the
+            // distance to that face plus the whole radius, because the centre
+            // itself is still inside.
+            let (dist, normal) = aabb.nearest_face(pos);
             (normal, dist + radius)
         };
 

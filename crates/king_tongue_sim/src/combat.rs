@@ -132,7 +132,7 @@ pub struct Resolution {
 
 impl Resolution {
     /// Nothing happened: the caller writes this back and the tick is unchanged
-    /// apart from the contact latch.
+    /// apart from the contact flag.
     fn inert(hero: &HeroPass, enemy: &EnemyTarget, touching: bool) -> Self {
         Resolution {
             hero_vel: hero.vel,
@@ -162,8 +162,8 @@ impl Resolution {
 pub fn resolve_contact(hero: &HeroPass, enemy: &EnemyTarget) -> Resolution {
     let box_ = Aabb::new(enemy.pos, ENEMY_HALF_EXTENTS);
     let Some(contact) = swept_contact(hero.start, hero.end - hero.start, hero.radius, box_) else {
-        // Out of contact clears the latch, which is what lets the next pass
-        // register.
+        // Out of contact clears the contact flag, which is what lets the next
+        // pass register.
         return Resolution::inert(hero, enemy, false);
     };
 
@@ -187,7 +187,7 @@ pub fn resolve_contact(hero: &HeroPass, enemy: &EnemyTarget) -> Resolution {
         // The elastic repel is a contact response and not an impact, so it is
         // applied on every tick of contact. That is what lets a hero come to
         // rest against an Enemy rather than sinking through it. Only the
-        // `Toughness` it spends is latched to once per contact.
+        // `Toughness` it spends is held to once per contact.
         let separated = kick(hero, enemy, contact.normal);
         return Resolution {
             hero_vel: separated.0,
@@ -355,25 +355,10 @@ fn surface_normal(pos: Vec2, target: Aabb) -> Vec2 {
     }
     // The centre is inside the box, so the geometry offers no outward direction.
     // Leave through the nearest face: the shortest way out, and the only choice
-    // that does not teleport a body across the level.
-    let to_min = pos - target.min();
-    let to_max = target.max() - pos;
-    [
-        (to_min.x, Vec2::NEG_X),
-        (to_max.x, Vec2::X),
-        (to_min.y, Vec2::NEG_Y),
-        (to_max.y, Vec2::Y),
-    ]
-    .iter()
-    .copied()
-    .fold((f32::INFINITY, Vec2::Y), |best, face| {
-        if face.0 < best.0 {
-            face
-        } else {
-            best
-        }
-    })
-    .1
+    // that does not teleport a body across the level. Shared with `World`'s
+    // depenetration, which needs the same face for the same reason and also
+    // reads the distance; see [`Aabb::nearest_face`].
+    target.nearest_face(pos).1
 }
 
 /// The fraction of `motion` at which a ray first enters a circle, if it does.
@@ -652,7 +637,10 @@ mod tests {
         assert_eq!(out.band, None);
         assert_eq!(out.toughness, 100.0);
         assert_eq!(out.hero_vel, hero.vel);
-        assert!(out.touching, "the latch must hold while contact lasts");
+        assert!(
+            out.touching,
+            "the contact flag must hold while contact lasts"
+        );
     }
 
     #[test]

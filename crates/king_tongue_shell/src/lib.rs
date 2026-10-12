@@ -134,17 +134,25 @@ pub fn camera_origin(
 ) -> macroquad::math::Vec2 {
     let centre = screen * 0.5;
     // Inverting `to_screen` for the hero's position: whatever origin puts the
-    // hero at the centre of the screen. The fallback is reachable: the Kill
-    // Bound removes any body that leaves the level's `world_bounds`, the hero
-    // included, and a removed body is simply absent from the Snapshot. Drawing
-    // the world origin at the centre is the inert choice, and it stays a
-    // drawing fallback rather than a game rule: the Shell learns nothing about
-    // despawning and decides nothing because of it.
+    // hero at the centre of the screen. Routed **through** `to_screen` rather
+    // than restating its arithmetic backwards, so the transform lives in one
+    // place and the Camera cannot drift away from the thing that draws.
+    //
+    // What makes that possible is that the origin enters `to_screen` purely
+    // additively, so `to_screen(v, o)` is `to_screen(v, 0) + o` and the origin
+    // that lands `v` on `centre` is `centre - to_screen(v, 0)`. Checked to be
+    // bit-identical to the hand-inverted form over every screen centre a
+    // window can report, which is any non-negative pair: the two differ only
+    // in the sign of a zero, and only when the centre is itself negative zero.
+    //
+    // The fallback is reachable: the Kill Bound removes any body that leaves
+    // the level's `world_bounds`, the hero included, and a removed body is
+    // simply absent from the Snapshot. Drawing the world origin at the centre
+    // is the inert choice, and it stays a drawing fallback rather than a game
+    // rule: the Shell learns nothing about despawning and decides nothing
+    // because of it.
     view.body(hero).map_or(centre, |body| {
-        macroquad::math::Vec2::new(
-            centre.x - body.pos.x * PIXELS_PER_UNIT,
-            centre.y + body.pos.y * PIXELS_PER_UNIT,
-        )
+        centre - to_screen(body.pos, macroquad::math::Vec2::ZERO)
     })
 }
 
