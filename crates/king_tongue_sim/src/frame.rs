@@ -529,6 +529,46 @@ mod tests {
     }
 
     #[test]
+    fn the_combo_count_is_carried_across_whole_rather_than_blended() {
+        // A Combo is a count of hits, so there is no value between two of them:
+        // blending three toward four would have the Shell draw 3.5 hits for
+        // half a frame. ADR-0002 keeps discrete events out of interpolation and
+        // a hit landing is exactly one, so the latest count is carried through
+        // untouched at every alpha.
+        let prev = Snapshot {
+            combo: 3,
+            tick: 1,
+            bodies: vec![],
+            tongues: vec![],
+        };
+        let cur = Snapshot {
+            combo: 4,
+            tick: 2,
+            bodies: vec![],
+            tongues: vec![],
+        };
+        let mut out = Snapshot::default();
+        for alpha in [0.0, 0.25, 0.5, 0.999, 1.0] {
+            interpolate_into(&prev, &cur, alpha, &mut out);
+            assert_eq!(
+                out.combo, 4,
+                "at alpha {alpha} the view must carry the current count"
+            );
+        }
+
+        // And a broken run reads as broken immediately, rather than fading out
+        // of the previous snapshot's count.
+        let broken = Snapshot {
+            combo: 0,
+            tick: 3,
+            bodies: vec![],
+            tongues: vec![],
+        };
+        interpolate_into(&cur, &broken, 0.5, &mut out);
+        assert_eq!(out.combo, 0, "a Combo that broke must read as broken");
+    }
+
+    #[test]
     fn facing_interpolation_survives_the_wrap_boundary() {
         // Facings 10 degrees apart either side of due right. Angle lerp would be
         // fine here, but storing unit vectors means the 359-to-1 case is the same

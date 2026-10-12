@@ -234,6 +234,30 @@ pub fn slam_run(tick: u64, world: &mut World) {
     }
 }
 
+/// Skids the hero through a row of Enemies and into a wall, so one run builds
+/// a Combo and then loses it.
+///
+/// The Combo is the one thing in the trace that is neither a position nor a
+/// body count, and it is mutated state advanced once per Sim Tick, which is a
+/// different hazard from everything above: a count advanced from inside a force
+/// evaluation would be advanced twice per tick by ADR-0007's integrator, and a
+/// count whose increment depended on the order Enemies were visited in would
+/// differ between runs on a tick that hit two of them. Both show up here.
+///
+/// The hero's start is read out of the `Snapshot` rather than written as a
+/// coordinate, so the script cannot drift out of step with the scene it is run
+/// against.
+pub fn combo_run(tick: u64, world: &mut World) {
+    if tick != 0 {
+        return;
+    }
+    let hero = world.hero_id();
+    let Some(pos) = world.snapshot().body(hero).map(|body| body.pos) else {
+        return;
+    };
+    world.place(hero, pos, Vec2::new(60.0, 0.0));
+}
+
 /// Flings every body out of the level's Kill Bound, each on its own tick.
 ///
 /// The hero is launched along the floor and out of the right edge; the Enemies
@@ -325,6 +349,13 @@ pub fn first_divergence(left: &[Snapshot], right: &[Snapshot]) -> Option<String>
             ));
         }
         let tick = a.tick;
+
+        if a.combo != b.combo {
+            return Some(format!(
+                "tick {tick}: Combo counts differ, {} against {}",
+                a.combo, b.combo
+            ));
+        }
 
         if a.bodies.len() != b.bodies.len() {
             return Some(format!(
@@ -468,6 +499,65 @@ mod tests {
         assert!(
             after < before,
             "the scripted run destroyed nothing: {before} bodies throughout"
+        );
+    }
+
+    /// A walled room with the hero on the floor and a row of Enemies in its
+    /// path, so `combo_run` builds a Combo and then runs out of room.
+    ///
+    /// The wall is what makes the Combo end: with no friction anywhere, a hero
+    /// skidding along the floor only comes to rest when something takes the
+    /// last of its momentum.
+    fn combo_scene() -> Level {
+        Level::from_ascii(
+            "
+            ############
+            #@.eee.....#
+            ############
+            ",
+        )
+    }
+
+    #[test]
+    fn a_run_that_builds_and_loses_a_combo_is_deterministic() {
+        // The Combo is state that is mutated once per Sim Tick rather than
+        // integrated, so it can diverge in ways position cannot: advanced from
+        // the wrong point in the tick, advanced twice by ADR-0007's two force
+        // evaluations, or incremented in an order that depended on which Enemy
+        // the body list happened to list first.
+        assert_deterministic(&combo_scene(), 300, combo_run);
+    }
+
+    #[test]
+    fn the_combo_script_really_builds_a_combo_and_really_loses_it() {
+        // Guards the test above from passing vacuously, the way the slam run
+        // and the Kill Bound run are guarded. A script that landed no Slam, or
+        // one whose Combo never ended, would agree with itself perfectly and
+        // asserts nothing about the Combo.
+        let trace = record(&combo_scene(), 300, combo_run);
+        let counts: Vec<u32> = trace.iter().map(|s| s.combo).collect();
+
+        assert_eq!(counts[0], 0, "a run starts with no Combo");
+        let peak = counts
+            .iter()
+            .copied()
+            .max()
+            .expect("a trace is never empty");
+        assert!(
+            peak >= 3,
+            "the scripted run should chain the whole row, peaked at {peak}"
+        );
+        assert_eq!(
+            *counts.last().expect("a trace is never empty"),
+            0,
+            "the Combo should have ended by the time the hero stopped: {counts:?}"
+        );
+        // And it rose a hit at a time rather than appearing whole, which is
+        // what makes the trace carry a changing count for several ticks.
+        let rises = counts.windows(2).filter(|w| w[1] > w[0]).count();
+        assert!(
+            rises >= 2,
+            "the count should climb over several ticks, got {counts:?}"
         );
     }
 
@@ -698,6 +788,29 @@ mod tests {
             trace.last().expect("a trace is never empty").tongues.len(),
             crate::MAX_TONGUES,
             "three fingers must leave exactly two Tongues"
+        );
+    }
+
+    #[test]
+    fn the_harness_notices_a_combo_that_differs_and_nothing_else() {
+        // The Combo is the only thing in a `Snapshot` that two runs can
+        // disagree on while every position agrees to the bit, so a comparison
+        // that skipped it would report success on exactly the divergence this
+        // ticket added. Built by hand because no scene can produce the case: a
+        // simulation whose counts differ has diverged somewhere upstream too.
+        let snapshot = |combo| Snapshot {
+            tick: 7,
+            combo,
+            bodies: vec![],
+            tongues: vec![],
+        };
+        assert!(
+            first_divergence(&[snapshot(4)], &[snapshot(5)]).is_some(),
+            "a Combo of 4 against 5 must be reported as a divergence"
+        );
+        assert!(
+            first_divergence(&[snapshot(4)], &[snapshot(4)]).is_none(),
+            "identical snapshots must not be reported as divergent"
         );
     }
 
