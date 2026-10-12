@@ -365,7 +365,7 @@ pub fn swept_contact(start: Vec2, motion: Vec2, radius: f32, target: Aabb) -> Op
             t: 0.0,
             #[cfg(any(test, feature = "test-util"))]
             pos: start,
-            normal: surface_normal(start, target),
+            normal: surface_normal(start, target, motion),
         });
     }
 
@@ -415,7 +415,7 @@ pub fn swept_contact(start: Vec2, motion: Vec2, radius: f32, target: Aabb) -> Op
             t,
             #[cfg(any(test, feature = "test-util"))]
             pos,
-            normal: surface_normal(pos, target),
+            normal: surface_normal(pos, target, motion),
         }
     })
 }
@@ -425,21 +425,58 @@ fn overlaps(pos: Vec2, radius: f32, target: Aabb) -> bool {
     (pos - pos.clamp(target.min(), target.max())).length_squared() <= radius * radius
 }
 
-/// The outward direction from a box to a point, as a unit vector.
+/// The contact direction between a box and a point that swept to it along
+/// `motion`, as a unit vector pointing out of the box.
 ///
-/// Exact: in a face region it is the face normal, and in a corner region it is
-/// the diagonal from the corner, which is what a round body actually touches a
-/// square one with.
-fn surface_normal(pos: Vec2, target: Aabb) -> Vec2 {
+/// Exact wherever the geometry can answer: in a face region it is the face
+/// normal, and in a corner region it is the diagonal from the corner, which is
+/// what a round body actually touches a square one with.
+///
+/// **Strictly inside the box, the answer is centre to centre and not a face.**
+/// A point inside has no outward direction to read off the geometry at all, and
+/// the nearest face is then a geometric tie-break rather than a contact
+/// direction: on a tie it is whichever face [`Aabb::nearest_face`] lists first,
+/// deliberately arbitrary but fixed. The normal is the gate, so an arbitrary
+/// direction leaves `closing` arbitrarily signed, and a pair whose centres were
+/// genuinely closing read as separating and registered nothing. Measured: a
+/// hero penetrated to an offset of (0.4, 0.3) and closing at (10, -20) read
+/// `-10` against the box's own +x face while its distance to the Enemy's centre
+/// was shrinking.
+///
+/// The direction from the box's centre to the point is the honest answer,
+/// because it makes `closing` mean exactly what it should mean for two
+/// overlapping bodies: the rate at which the centres are approaching. A body
+/// moving into the hero therefore cannot read as separating, and the normal
+/// varies continuously with the offset instead of flipping between faces on
+/// sub-unit positioning. This is still geometry and reads no velocity.
+///
+/// Exactly co-located centres offer no offset either, and `motion` is then the
+/// limit of the case above: a body that left the centre travelled along
+/// `motion`, so that is where its offset is about to point. Both of these
+/// registering nothing is correct rather than a concession, because from
+/// co-located centres the only thing two bodies can do is separate; the impact
+/// on the way *in* is a boundary contact, which [`swept_contact_between`]
+/// finds exactly.
+///
+/// With no relative motion either, the nearest face is all that is left, and it
+/// is kept for exactly that case. It is reachable at rest: ticket #20 recorded
+/// that two bodies can come to rest exactly co-located in a corner. Nothing
+/// registers there, because a pair with no relative motion has no closing
+/// speed, and ADR-0002 is satisfied because the tie-break is fixed rather than
+/// merely arbitrary. The same face `World`'s depenetration reads, which needs
+/// the distance as well; see [`Aabb::nearest_face`].
+fn surface_normal(pos: Vec2, target: Aabb, motion: Vec2) -> Vec2 {
     let away = pos - pos.clamp(target.min(), target.max());
     if away.length_squared() > 1e-18 {
         return away.normalize();
     }
-    // The centre is inside the box, so the geometry offers no outward direction.
-    // Leave through the nearest face: the shortest way out, and the only choice
-    // that does not teleport a body across the level. Shared with `World`'s
-    // depenetration, which needs the same face for the same reason and also
-    // reads the distance; see [`Aabb::nearest_face`].
+    let offset = pos - target.centre;
+    if offset.length_squared() > 1e-18 {
+        return offset.normalize();
+    }
+    if motion.length_squared() > 1e-18 {
+        return motion.normalize();
+    }
     target.nearest_face(pos).1
 }
 
@@ -894,6 +931,53 @@ mod tests {
         // are the numbers the comments assume, so a retune cannot leave this
         // test quietly asserting the wrong boundaries.
         assert_eq!(KICK_THRESHOLD, 2.0, "retune the rows above with the gate");
+    }
+
+    #[test]
+    fn a_penetrated_pair_whose_centres_are_closing_cannot_read_as_separating() {
+        // A hero whose centre is strictly inside an Enemy's box has no outward
+        // direction to read off the geometry, and the nearest face it used to
+        // fall back to is a tie-break and not a contact direction. Here the
+        // offset is (0.4, 0.3), so the nearest face is the box's own +x face at
+        // 0.1 away, while the centres are closing along (0.8, 0.6).
+        //
+        // Expected values worked out from the geometry by hand and not from the
+        // code. Against +x the gate reads `(-10, 20) . (1, 0)` which is -10, so
+        // the whole impact was discarded as separation; against the centre
+        // direction it reads `(-10, 20) . (0.8, 0.6)` which is 4, and the
+        // distance between the centres really is shrinking, at that same 4
+        // units per second. At the hero's unit mass 4 of normal momentum is
+        // above KICK_THRESHOLD and far below a pool of 100, so it is the Slam
+        // band and the pool takes 4.
+        let start = Vec2::new(0.4, 0.3);
+        let vel = Vec2::new(10.0, -20.0);
+        let hero = pass(start, start + vel * crate::DT, vel);
+        let out = resolve_contact(&hero, &enemy(100.0));
+        assert_eq!(out.band, Some(ImpactBand::Slam), "{out:?}");
+        assert!(
+            (out.toughness - 96.0).abs() < 1e-4,
+            "the pool must take the closing momentum of 4: {out:?}"
+        );
+        // The independent reading of the same fact: the centres were closing.
+        let closing_rate = -(hero.end - hero.start).dot(start.normalize()) / crate::DT;
+        assert!(
+            closing_rate > 0.0,
+            "the fixture must really be closing, measured {closing_rate}"
+        );
+
+        // And the degenerate case the nearest face is kept for: exactly
+        // co-located centres with no relative motion at all, which ticket #20
+        // recorded two bodies can reach at rest in a corner. Nothing registers,
+        // because a pair with no relative motion has no closing speed, and the
+        // answer is a fixed one rather than a NaN.
+        let at_rest = pass(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO);
+        let out = resolve_contact(&at_rest, &enemy(100.0));
+        assert_eq!(out.band, None, "{out:?}");
+        assert_eq!(out.toughness, 100.0);
+        assert!(
+            out.hero_vel.is_finite() && out.enemy_vel.is_finite(),
+            "{out:?}"
+        );
     }
 
     #[test]
