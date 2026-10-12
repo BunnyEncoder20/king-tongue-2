@@ -16,6 +16,7 @@ use crate::frame::Snapshot;
 use crate::input::{TouchPhase, TouchSample};
 use crate::level::Level;
 use crate::world::World;
+use crate::Anchor;
 use glam::Vec2;
 
 /// A scripted run's input: given the Sim Tick about to be simulated and the
@@ -658,6 +659,84 @@ pub fn record(level: &Level, ticks: u32, script: Script) -> Vec<Snapshot> {
         trace.push(world.snapshot().clone());
     }
     trace
+}
+
+/// Writes a trace as text, one line per Sim Tick, losing nothing.
+///
+/// Every float goes out as the hex of its bits rather than as a decimal, which
+/// is the whole reason this function exists rather than a `Debug` print: the
+/// claim is that two runs agree to the **bit**, and a decimal rendering of an
+/// `f32` either rounds (and hides a divergence in the last place) or is
+/// shortest-round-trip (and hides nothing, but only if the writer and the
+/// reader agree on the algorithm). Bits cannot be argued with.
+///
+/// This is what crosses a process boundary. [`first_divergence`] compares two
+/// traces inside one process, which cannot answer the question ticket #20
+/// actually asks: a `World` that leaked address-space entropy, a hash seed, or
+/// a pointer-ordered iteration into the simulation would agree with itself all
+/// day and disagree with a second invocation of the same binary. ADR-0006
+/// records that `HashMap` iteration order nearly did exactly that.
+pub fn encode_trace(trace: &[Snapshot]) -> String {
+    let mut out = String::with_capacity(trace.len() * 96);
+    for snapshot in trace {
+        encode_snapshot(snapshot, &mut out);
+        out.push('\n');
+    }
+    out
+}
+
+fn encode_snapshot(snapshot: &Snapshot, out: &mut String) {
+    use core::fmt::Write as _;
+    let _ = write!(out, "t{} c{}", snapshot.tick, snapshot.combo);
+    for body in &snapshot.bodies {
+        // An exhaustive match with no catch-all arm, for the same reason the
+        // Shell's `draw_body` has one: a new `BodyKind` must break the build
+        // here too, or a trace would silently stop distinguishing it and the
+        // cross-process comparison would pass over exactly the divergence the
+        // new kind introduced.
+        let kind = match body.kind {
+            crate::BodyKind::Hero => 'h',
+            crate::BodyKind::Enemy => 'e',
+            crate::BodyKind::Thrown => 't',
+        };
+        let _ = write!(out, " b{}{kind}", body.id.0);
+        encode_vec(body.pos, out);
+        encode_vec(body.facing, out);
+    }
+    for tongue in &snapshot.tongues {
+        let _ = write!(out, " g{}", tongue.slot);
+        match tongue.anchor {
+            Anchor::Fixed(point) => {
+                out.push('f');
+                encode_vec(point, out);
+            }
+            Anchor::Movable(id) => {
+                let _ = write!(out, "m{}", id.0);
+            }
+        }
+        encode_vec(tongue.from, out);
+        encode_vec(tongue.to, out);
+    }
+}
+
+fn encode_vec(v: Vec2, out: &mut String) {
+    use core::fmt::Write as _;
+    let _ = write!(out, ":{:08x}:{:08x}", v.x.to_bits(), v.y.to_bits());
+}
+
+/// Describes the first line two encoded traces disagree on, or `None` if they
+/// are identical.
+///
+/// Line by line rather than as one string comparison, because the message is
+/// the point: a cross-process failure is the hardest kind to reproduce, so the
+/// first thing it has to say is which tick of which run went wrong.
+pub fn first_encoded_divergence(left: &str, right: &str) -> Option<String> {
+    let mut lines = left.lines().zip(right.lines());
+    if let Some((i, (a, b))) = lines.by_ref().enumerate().find(|(_, (a, b))| a != b) {
+        return Some(format!("line {i} differs:\n  {a}\n  {b}"));
+    }
+    let (l, r) = (left.lines().count(), right.lines().count());
+    (l != r).then(|| format!("trace lengths differ: {l} lines against {r}"))
 }
 
 /// Runs the same scene and script twice and fails if the two traces differ in
@@ -1519,6 +1598,258 @@ mod tests {
     /// A full minute of Sim Ticks, which is the length the energy budget and
     /// the stability sweep are stated over as well.
     const MINUTE: u32 = 3600;
+
+    /// One registered scripted run: a scene, a script, how long to run it, and
+    /// the ticks on which the script reaches into the `World` and assigns a
+    /// velocity.
+    ///
+    /// The registry exists because ticket #20's claims are about the whole set
+    /// rather than about one run. Cross-process agreement, the stability sweep
+    /// and the energy budget each have to hold for every script in this module,
+    /// and a list is what stops a later ticket adding a twelfth script that
+    /// two of the three never see.
+    struct Run {
+        name: &'static str,
+        level: Level,
+        ticks: u32,
+        script: Script,
+    }
+
+    fn runs() -> Vec<Run> {
+        vec![
+            Run {
+                name: "no_input",
+                level: scene(),
+                ticks: 300,
+                script: no_input,
+            },
+            Run {
+                name: "slam_run",
+                level: combat_scene(),
+                ticks: 300,
+                script: slam_run,
+            },
+            Run {
+                name: "combo_run",
+                level: combo_scene(),
+                ticks: 300,
+                script: combo_run,
+            },
+            Run {
+                name: "kill_bound_run",
+                level: kill_bound_scene(),
+                ticks: 300,
+                script: kill_bound_run,
+            },
+            Run {
+                name: "fires_two_tongues",
+                level: enclosed_scene(),
+                ticks: 300,
+                script: fires_two_tongues,
+            },
+            Run {
+                name: "releases_mid_swing",
+                level: enclosed_scene(),
+                ticks: 300,
+                script: releases_mid_swing,
+            },
+            Run {
+                name: "braces_between_two_anchors",
+                level: enclosed_scene(),
+                ticks: 300,
+                script: braces_between_two_anchors,
+            },
+            Run {
+                name: "hammers_three_fingers",
+                level: enclosed_scene(),
+                ticks: 300,
+                script: hammers_three_fingers,
+            },
+            Run {
+                name: "swings_on_an_enemy",
+                level: enemy_overhead_scene(),
+                ticks: 300,
+                script: swings_on_an_enemy,
+            },
+            Run {
+                name: "throws_an_enemy",
+                level: throw_scene(),
+                ticks: 300,
+                script: throws_an_enemy,
+            },
+            Run {
+                name: "throws_an_enemy_into_another",
+                level: throw_and_strike_scene(),
+                ticks: 300,
+                script: throws_an_enemy_into_another,
+            },
+            Run {
+                name: "every_mechanic",
+                level: everything_scene(),
+                ticks: MINUTE,
+                script: every_mechanic,
+            },
+        ]
+    }
+
+    /// Every registered run's trace, encoded, with a header line per run.
+    fn encode_all_runs() -> String {
+        let mut out = String::new();
+        for run in runs() {
+            out.push_str("== ");
+            out.push_str(run.name);
+            out.push('\n');
+            out.push_str(&encode_trace(&record(&run.level, run.ticks, run.script)));
+        }
+        out
+    }
+
+    /// Markers the child prints around its traces, so the parent can find them
+    /// in among libtest's own output.
+    const TRACE_BEGIN: &str = "<<<KING-TONGUE-TRACE-BEGIN>>>";
+    const TRACE_END: &str = "<<<KING-TONGUE-TRACE-END>>>";
+
+    /// The child half of [`separate_process_invocations_agree_to_the_bit`].
+    ///
+    /// `#[ignore]`d rather than conditioned on an environment variable, because
+    /// ignoring is how libtest already says "only when asked by name" and the
+    /// parent asks by name. It prints and asserts nothing: its whole job is to
+    /// be a second process.
+    #[test]
+    #[ignore = "the child half of separate_process_invocations_agree_to_the_bit"]
+    fn emit_encoded_traces_for_a_parent_process() {
+        println!("{TRACE_BEGIN}");
+        print!("{}", encode_all_runs());
+        println!("{TRACE_END}");
+    }
+
+    #[test]
+    fn separate_process_invocations_agree_to_the_bit() {
+        // The acceptance criterion no test in this repository could state
+        // before: identical results across separate process invocations. It is
+        // a different claim from running the same scene twice in one process
+        // and it rules out a different class of bug. Within one process,
+        // anything the simulation leaked from the environment is the *same*
+        // leak on both runs: a `HashMap`'s per-process hash seed, a pointer
+        // value read as a number, an address-ordered iteration, a lazily
+        // initialised static. Every one of those agrees with itself and
+        // disagrees with the next invocation, and ADR-0006 records that touch
+        // iteration order nearly shipped exactly that bug.
+        //
+        // The child is this very test binary, re-executed. That is deliberate:
+        // the alternative, an example binary shelled out to through cargo,
+        // would put a build system inside a test, and the boundary check in
+        // `scripts/check-sim-deps.sh` would have one more target to reason
+        // about. Re-execution needs nothing but std.
+        let exe = std::env::current_exe().expect("a test binary knows its own path");
+        let child = |label: &str, extra: &[(&str, &str)]| -> String {
+            let mut command = std::process::Command::new(&exe);
+            command.args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "determinism::tests::emit_encoded_traces_for_a_parent_process",
+            ]);
+            for (key, value) in extra {
+                command.env(key, value);
+            }
+            let out = command
+                .output()
+                .unwrap_or_else(|e| panic!("could not re-execute {exe:?} as a child: {e}"));
+            assert!(
+                out.status.success(),
+                "the {label} child failed: {}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let text = String::from_utf8(out.stdout).expect("the child prints only ASCII");
+            let start = text
+                .find(TRACE_BEGIN)
+                .map(|i| i + TRACE_BEGIN.len() + 1)
+                .unwrap_or_else(|| panic!("the {label} child printed no trace:\n{text}"));
+            let end = text.find(TRACE_END).expect("a begun trace must end");
+            text[start..end].to_owned()
+        };
+
+        // Two children rather than one, and with different environments, which
+        // is how the test reaches the thing it is actually about. A second
+        // process already differs from the first in its address space layout
+        // and in whatever seed the OS handed its hashers; a different
+        // environment block moves the stack and the environ pointers as well.
+        // Anything the simulation reads from any of that disagrees here.
+        let first = child("first", &[]);
+        let second = child(
+            "second",
+            &[
+                ("KING_TONGUE_PADDING", "................................"),
+                ("KING_TONGUE_MORE_PADDING", "........"),
+            ],
+        );
+        let here = encode_all_runs();
+
+        if let Some(where_) = first_encoded_divergence(&here, &first) {
+            panic!("this process and a child disagree: {where_}");
+        }
+        if let Some(where_) = first_encoded_divergence(&first, &second) {
+            panic!("two child processes disagree: {where_}");
+        }
+        // And the traces really are every registered run from first tick to
+        // last, which is the vacuity guard this test needs most: a child that
+        // printed its markers and nothing between them, or a registry that
+        // quietly lost a run, would make both comparisons above trivially
+        // true. One header line plus one line per tick plus the tick-zero
+        // snapshot, per run, counted from the registry rather than written down
+        // as a number that could go stale.
+        let expected: usize = runs().iter().map(|run| run.ticks as usize + 2).sum();
+        assert_eq!(
+            here.lines().count(),
+            expected,
+            "the encoded traces are not the whole registry"
+        );
+    }
+
+    #[test]
+    fn the_encoding_notices_a_divergence_a_decimal_rendering_would_hide() {
+        // A comparison that cannot fail is worse than no comparison. Two
+        // snapshots one bit apart in one coordinate must be reported, which is
+        // the case a decimal print would round away and the reason the encoding
+        // is hex bits in the first place.
+        let body = |x: f32| crate::Body {
+            id: crate::EntityId(1),
+            kind: crate::BodyKind::Hero,
+            pos: Vec2::new(x, 0.0),
+            facing: Vec2::X,
+        };
+        let snapshot = |x: f32| Snapshot {
+            tick: 3,
+            combo: 0,
+            bodies: vec![body(x)],
+            tongues: vec![],
+        };
+        let one = encode_trace(&[snapshot(1.0)]);
+        let nudged = encode_trace(&[snapshot(f32::from_bits(1.0f32.to_bits() + 1))]);
+        assert!(
+            first_encoded_divergence(&one, &nudged).is_some(),
+            "one bit of difference must be reported:\n  {one}  {nudged}"
+        );
+        assert!(
+            first_encoded_divergence(&one, &one).is_none(),
+            "identical traces must not be reported as divergent"
+        );
+        // And negative zero, which `==` reads as equal to zero and a sign flip
+        // at a contact really does produce.
+        let zero = encode_trace(&[snapshot(0.0)]);
+        let negative = encode_trace(&[snapshot(-0.0)]);
+        assert!(
+            first_encoded_divergence(&zero, &negative).is_some(),
+            "-0.0 against 0.0 must be reported"
+        );
+        // A trace cut short is a divergence too, not a prefix match.
+        assert!(
+            first_encoded_divergence(&one, "").is_some(),
+            "an empty trace must not compare equal to a real one"
+        );
+    }
 
     #[test]
     fn a_run_with_every_mechanic_at_once_produces_identical_snapshot_sequences() {
