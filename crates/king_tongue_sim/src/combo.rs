@@ -108,9 +108,12 @@ pub struct Combo {
     /// Sim Ticks since the last Slam. Only meaningful while `hits > 0`.
     idle_ticks: u32,
     /// Consecutive Sim Ticks of slow terrain contact, which is how "comes to
-    /// rest" is measured. Counted whether or not a Combo is live, so that a
-    /// Combo started while already at rest is judged on the ticks after it
-    /// rather than inheriting the ones before.
+    /// rest" is measured.
+    ///
+    /// Counted whether or not a Combo is live, rather than started when one
+    /// begins. A hero that is already standing still is already at rest, so a
+    /// run that somehow started there does not survive its first tick, which is
+    /// the honest answer: nothing about a Combo is reachable from a standstill.
     rest_ticks: u32,
 }
 
@@ -143,9 +146,10 @@ impl Combo {
         // stays slow in.
         if self.rest_ticks >= REST_CONTACT_TICKS {
             self.break_run();
-            // Not an early return: a Slam landing on the tick a run ended
-            // starts the next one, which is the same thing that happens on any
-            // other tick with no live Combo.
+            // Not an early return, so that a Slam landing on this tick is still
+            // counted rather than silently dropped. It starts a run that the
+            // next tick ends again while the hero stays still, which is the
+            // same answer by a less surprising route than discarding the hit.
         }
 
         if slams > 0 {
