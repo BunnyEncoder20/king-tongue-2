@@ -56,6 +56,8 @@ While Thrown, its collision rules invert completely:
 
 Deliberately high risk and high reward: any terrain contact ends it, so using an Enemy as a weapon demands real control rather than being free damage.
 
+The freed Anchor slot in that last row is now the general rule rather than a special case of mutual destruction: ADR-0014 frees the slot whenever a Movable Anchor leaves the simulation, by either route, and cites this matrix as the precedent it generalises.
+
 ## Despawn is world-space
 
 A destroyed or Thrown Enemy leaving the level's Kill Bound is removed. The bound is declared in level data as a world-space rectangle and is never a screen-space test, because screen dimensions vary across the device floor and a screen-space test would make outcomes device-dependent, voiding the determinism ADR-0002 exists to provide.

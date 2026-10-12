@@ -20,9 +20,19 @@ Universal anchorability is itself load-bearing rather than a simplification. Anc
 
 Enemies are small and moving, so one narrow **Enemy Assist Arc** survives, scoped to them alone. An Enemy inside the arc is preferred over the static terrain directly behind it. This expresses a target preference and nothing else: it never alters the ray's direction, so the hero still attaches along exactly the vector that was tapped.
 
+**The arc is 10 degrees either side of the tapped vector, and three rules bound it.** The half-angle is deliberately well inside the 30 degree cone this ADR removed, because anything wider is that cone arriving by the side door; it is a starting point for device tuning like every other touch constant here.
+
+An Enemy **further along the ray than the terrain hit is not a candidate**, so a wall genuinely blocks. Assist picks between things the tap could have hit; it does not reach through geometry. An Enemy **behind the tap** is never a candidate either, which needs saying because the dot product that measures the arc is just as happy with a direction's reverse unless the sign is checked.
+
+And an Enemy the ray **literally strikes** is a candidate whatever the arc says. A close, wide Enemy subtends more than 10 degrees from the hero's position, so judging it on its centre alone would let a tap pass straight through the body it was pointed at and attach to the wall beyond, which is the one outcome nobody would read as assist. A literal hit is not assist at all, so the arc has no business overruling it.
+
+Where two Enemies both qualify, the nearer along the ray wins. Discovered while implementing ticket #17.
+
 ## Movable Anchors attach at the centre of mass
 
 A Tongue attaching to an Enemy or any other Movable Anchor attaches at its exact centre of mass, never at the surface point the ray struck and never at an offset attachment node. This keeps the spring force collinear with the line between the two bodies, which is what makes the mass-ratio pull in ADR-0003 and the tension calculation in ADR-0011 well defined. A surface attachment point would introduce a torque the simulation has no way to represent, since bodies here have no angular dynamics.
+
+The attachment point therefore moves every tick, and comparing it is not how a Tongue on an Enemy is recognised between snapshots; ADR-0009 settled that by having a `TongueLine` carry the whole `Anchor`, which compares a Movable one by identity. A Tongue whose Movable Anchor leaves the simulation entirely is ADR-0014.
 
 ## There is no whiff
 
