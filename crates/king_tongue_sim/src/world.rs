@@ -719,10 +719,16 @@ impl World {
                 radius: PLAYER_RADIUS,
             };
             let enemy = self.bodies[i];
+            // The Enemy's own path, not just its end position: the sweep is
+            // relative, so a fast Enemy cannot cross the hero untouched. A body
+            // with no half-step was added mid-tick, which nothing does yet, and
+            // reads as having stood still.
+            let enemy_start = self.half_step_of(i).map_or(enemy.pos, |s| s.start);
             let resolved = combat::resolve_contact(
                 &pass,
                 &combat::EnemyTarget {
-                    pos: enemy.pos,
+                    start: enemy_start,
+                    end: enemy.pos,
                     vel: enemy.vel,
                     mass: enemy.mass,
                     toughness: enemy.toughness,
@@ -819,8 +825,13 @@ impl World {
                     vel: self.bodies[i].vel,
                     mass: self.bodies[i].mass,
                 };
+                // The victim's own path too, for the same reason the hero's
+                // impacts read the Enemy's: the sweep is relative, so a fast
+                // victim cannot dodge a weapon by crossing it inside one tick.
+                let victim_start = self.half_step_of(j).map_or(self.bodies[j].pos, |s| s.start);
                 let victim = thrown::Victim {
-                    pos: self.bodies[j].pos,
+                    start: victim_start,
+                    end: self.bodies[j].pos,
                     vel: self.bodies[j].vel,
                     mass: self.bodies[j].mass,
                 };

@@ -98,7 +98,18 @@ pub struct HeroPass {
 /// One Enemy as a target of an impact.
 #[derive(Clone, Copy, Debug)]
 pub struct EnemyTarget {
-    pub pos: Vec2,
+    /// Where the Enemy was at the start of the tick, before integration.
+    ///
+    /// Here because a collision is a question about the two paths that were
+    /// travelled and not about where either body ended up. Sweeping the hero's
+    /// path against the Enemy's *end* box left the Enemy's own motion unswept
+    /// entirely, so a stationary hero was a zero-length sweep, which is a plain
+    /// overlap test through a window about two units wide: an Enemy moving more
+    /// than roughly that per Sim Tick crossed it untouched. See
+    /// [`swept_contact_between`].
+    pub start: Vec2,
+    /// Where it ended, after integration and terrain contact.
+    pub end: Vec2,
     pub vel: Vec2,
     pub mass: f32,
     /// Remaining `Toughness`, in momentum units.
@@ -176,8 +187,14 @@ impl Resolution {
 
 /// Resolves one tick of the hero's pass against one Enemy.
 pub fn resolve_contact(hero: &HeroPass, enemy: &EnemyTarget) -> Resolution {
-    let box_ = Aabb::new(enemy.pos, ENEMY_HALF_EXTENTS);
-    let Some(contact) = swept_contact(hero.start, hero.end - hero.start, hero.radius, box_) else {
+    let Some(contact) = swept_contact_between(
+        hero.start,
+        hero.end,
+        hero.radius,
+        enemy.start,
+        enemy.end,
+        ENEMY_HALF_EXTENTS,
+    ) else {
         // Out of contact clears the allowance, which is what lets the next pass
         // register: contact ended, so the next one is a new contact.
         return Resolution::inert(hero, enemy, false);
@@ -274,6 +291,52 @@ fn kick(hero: &HeroPass, enemy: &EnemyTarget, normal: Vec2) -> (Vec2, Vec2) {
     (
         hero.vel + normal * (impulse / hero.mass),
         enemy.vel - normal * (impulse / enemy.mass),
+    )
+}
+
+/// Whether two moving bodies, a circle and a box, met over one Sim Tick.
+///
+/// **Relative, and that is the whole point of it.** Sweeping one body's path
+/// against the other's end-of-tick box leaves the second body's own motion
+/// unswept, so a body that happens to be standing still is a zero-length sweep:
+/// a plain overlap test through a window two radii plus two half extents wide,
+/// which anything crossing more than that per Sim Tick passes through untouched.
+/// Measured before this existed: an Enemy at 186 units per second went from 7.70
+/// to 10.80 straight past a hero parked at 9.50 and nothing registered at all.
+/// That is reachable without test scaffolding, because tension is force over
+/// mass, so a Tongue can keep accelerating a heavy Enemy that can never reach
+/// `THROW_TENSION` indefinitely.
+///
+/// Holding the box fixed at where it began and sweeping the *relative*
+/// displacement is the same question asked in the box's own frame, and it is
+/// symmetric: either body moving closes the tunnel, and which one is "the mover"
+/// stops mattering. Only the relative path can be swept, because a sweep answers
+/// "did these paths meet" and two independent motions have one relative path
+/// between them.
+///
+/// The normal that comes back is a direction, so it means the same thing in
+/// either frame and needs no converting. The contact position does not, and is
+/// in the box's frame; nothing downstream of here reads it, and it is gated to
+/// the tests that assert the sweep found the right point.
+///
+/// Shared by [`resolve_contact`] and [`crate::thrown::plough`] rather than
+/// written twice, for the reason [`Aabb::nearest_face`] was extracted: two
+/// copies of one piece of geometry are two things to keep in step, and the copy
+/// that is not looked at is the one that rots.
+pub fn swept_contact_between(
+    mover_start: Vec2,
+    mover_end: Vec2,
+    radius: f32,
+    target_start: Vec2,
+    target_end: Vec2,
+    target_half_extents: Vec2,
+) -> Option<Contact> {
+    let relative_motion = (mover_end - mover_start) - (target_end - target_start);
+    swept_contact(
+        mover_start,
+        relative_motion,
+        radius,
+        Aabb::new(target_start, target_half_extents),
     )
 }
 
@@ -419,7 +482,8 @@ mod tests {
 
     fn enemy(toughness: f32) -> EnemyTarget {
         EnemyTarget {
-            pos: Vec2::ZERO,
+            start: Vec2::ZERO,
+            end: Vec2::ZERO,
             vel: Vec2::ZERO,
             mass: 1.0,
             toughness,
@@ -706,6 +770,68 @@ mod tests {
     }
 
     #[test]
+    fn the_sweep_is_relative_so_either_body_moving_closes_the_tunnel() {
+        // One geometry, read from both sides, and the answer must not change:
+        // sweeping one body's path against the other's end box leaves the
+        // second body's motion unswept, so whichever body happens to be
+        // standing still becomes a zero-length sweep and a window two radii
+        // plus two half extents wide opens up in it.
+        //
+        // Three units of travel per tick is well past that window, which is
+        // about two units across here. The numbers are the geometry's and not
+        // the code's: the circle meets the box's near face at a radius short of
+        // it, so the relative offset at contact is -1.0 out of a path from -1.5
+        // to 1.5, which is a sixth of the way along.
+        const EXPECTED_T: f32 = 1.0 / 6.0;
+        let moving_circle = swept_contact_between(
+            Vec2::new(-1.5, 0.0),
+            Vec2::new(1.5, 0.0),
+            PLAYER_RADIUS,
+            Vec2::ZERO,
+            Vec2::ZERO,
+            ENEMY_HALF_EXTENTS,
+        )
+        .expect("a circle crossing a still box must register");
+        let moving_box = swept_contact_between(
+            Vec2::ZERO,
+            Vec2::ZERO,
+            PLAYER_RADIUS,
+            Vec2::new(1.5, 0.0),
+            Vec2::new(-1.5, 0.0),
+            ENEMY_HALF_EXTENTS,
+        )
+        .expect("a box crossing a still circle must register too");
+        for hit in [moving_circle, moving_box] {
+            assert!((hit.t - EXPECTED_T).abs() < 1e-5, "{hit:?}");
+            assert!((hit.normal - Vec2::NEG_X).length() < 1e-5, "{hit:?}");
+        }
+    }
+
+    #[test]
+    fn a_fast_enemy_cannot_cross_a_stationary_hero_untouched() {
+        // The measured case: 186 units per second is 3.1 units of travel in one
+        // Sim Tick, and the hero is parked, so before the sweep went relative
+        // this read `band: None` with the pool untouched at 100.
+        //
+        // Reachable without scaffolding: tension is force over mass, so an
+        // Enemy of mass 4.8 or more can never reach `THROW_TENSION` even at
+        // twice the per-Tongue force ceiling, and a Tongue can therefore keep
+        // accelerating it through the hero indefinitely.
+        let hero = pass(Vec2::new(9.5, 0.0), Vec2::new(9.5, 0.0), Vec2::ZERO);
+        let mut target = enemy(100.0);
+        target.start = Vec2::new(7.7, 0.0);
+        target.end = Vec2::new(10.8, 0.0);
+        target.vel = Vec2::new(186.0, 0.0);
+        let out = resolve_contact(&hero, &target);
+        assert_eq!(
+            out.band,
+            Some(ImpactBand::Destroy),
+            "186 of normal momentum against a pool of 100: {out:?}"
+        );
+        assert!(out.destroyed(), "{out:?}");
+    }
+
+    #[test]
     fn a_hero_leaving_an_enemy_does_not_register_a_second_impact() {
         // Separating is not hitting. Taking the gate as an absolute magnitude
         // would read a hero flying away from a Kick as hitting it again.
@@ -980,6 +1106,33 @@ mod tests {
             assert!(
                 (measured - speed).abs() < 1e-2,
                 "expected {speed} to be preserved exactly, measured {measured}"
+            );
+        }
+
+        #[test]
+        fn a_fast_enemy_cannot_tunnel_through_a_parked_hero() {
+            // The same defect as `a_fast_enemy_cannot_cross_a_stationary_hero_untouched`,
+            // asserted through the seam instead: the hero is parked, which used
+            // to make its sweep zero length and open a window about two units
+            // wide, and the Enemy crosses 3.1 units in this one Sim Tick.
+            //
+            // The Enemy is driven directly rather than Tongued because the
+            // sweep sees the momentum and not the route to it. The route does
+            // exist: tension is force over mass, so an Enemy of mass 4.8 or
+            // more can never reach `THROW_TENSION` even at twice the per-Tongue
+            // force ceiling, and a Tongue can keep accelerating it forever.
+            let level = arena(vec![spawn(Vec2::new(-3.0, 0.0), 100.0, 1.0)]);
+            let mut world = World::from_level(&level);
+            let target = enemies(&world)[0].id;
+            world.place(world.hero_id(), Vec2::ZERO, Vec2::ZERO);
+            world.place(target, Vec2::new(-3.0, 0.0), Vec2::new(186.0, 0.0));
+
+            world.step();
+
+            assert!(
+                enemies(&world).is_empty(),
+                "186 of normal momentum against a pool of 100 must destroy, found {:?}",
+                enemies(&world)
             );
         }
 

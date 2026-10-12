@@ -18,7 +18,6 @@
 //! applied once, after the integration step, exactly like an impulse.
 
 use crate::combat::{self, ENEMY_HALF_EXTENTS};
-use crate::level::Aabb;
 use glam::Vec2;
 
 /// The tension above which a Tongue's Anchor loses control of its own momentum
@@ -195,7 +194,15 @@ pub struct Projectile {
 /// Another Enemy in a Thrown Enemy's path.
 #[derive(Clone, Copy, Debug)]
 pub struct Victim {
-    pub pos: Vec2,
+    /// Where it was at the start of the tick, before integration.
+    ///
+    /// Here for the reason [`crate::combat::EnemyTarget::start`] is: a
+    /// collision is a question about both paths. Sweeping the projectile's path
+    /// against the victim's end box left the victim's own motion unswept, so a
+    /// fast victim crossed a slow or parked weapon untouched.
+    pub start: Vec2,
+    /// Where it ended, after integration and terrain contact.
+    pub end: Vec2,
     pub vel: Vec2,
     pub mass: f32,
 }
@@ -212,9 +219,18 @@ pub struct Victim {
 /// *is* the gate, and a second threshold on top of it would be a fourth band
 /// ADR-0011 does not have.
 pub fn plough(projectile: &Projectile, victim: &Victim) -> Option<Plough> {
-    let box_ = Aabb::new(victim.pos, ENEMY_HALF_EXTENTS);
-    let motion = projectile.end - projectile.start;
-    let contact = combat::swept_contact(projectile.start, motion, THROWN_RADIUS, box_)?;
+    // Relative, so either body's motion closes the tunnel. The shared sweep
+    // holds why; this row of the matrix had the identical shape the hero's
+    // impacts did, and a fast victim could dodge a weapon by standing in front
+    // of a slow one.
+    let contact = combat::swept_contact_between(
+        projectile.start,
+        projectile.end,
+        THROWN_RADIUS,
+        victim.start,
+        victim.end,
+        ENEMY_HALF_EXTENTS,
+    )?;
 
     // Already separating. The sign is kept rather than taken as an absolute
     // value for the same reason [`crate::combat::resolve_contact`] keeps it: a
@@ -258,7 +274,8 @@ mod tests {
     /// A victim at the origin, in the path of [`projectile`].
     fn victim(mass: f32) -> Victim {
         Victim {
-            pos: Vec2::ZERO,
+            start: Vec2::ZERO,
+            end: Vec2::ZERO,
             vel: Vec2::ZERO,
             mass,
         }
@@ -389,7 +406,8 @@ mod tests {
     #[test]
     fn a_pass_that_meets_nothing_resolves_nothing() {
         let mut aside = victim(0.1);
-        aside.pos = Vec2::new(0.0, 10.0);
+        aside.start = Vec2::new(0.0, 10.0);
+        aside.end = aside.start;
         assert_eq!(plough(&projectile(1.0), &aside), None);
     }
 
@@ -408,6 +426,29 @@ mod tests {
         // Mutation check: the same geometry with the target standing still is
         // struck, so the test above is not passing because the paths missed.
         assert_eq!(plough(&projectile(1.0), &victim(1.0)), Some(Plough::Mutual));
+    }
+
+    #[test]
+    fn a_fast_victim_cannot_cross_a_stationary_projectile_untouched() {
+        // The same defect the hero's impacts had, in the same shape: only the
+        // projectile's path was swept, against the victim's end position, so a
+        // victim crossing 3.1 units in one Sim Tick read as nothing at all. The
+        // geometry it is asserted over lives in
+        // `combat::tests::the_sweep_is_relative_so_either_body_moving_closes_the_tunnel`;
+        // this is the matrix row reading it.
+        let parked = Projectile {
+            start: Vec2::new(9.5, 0.0),
+            end: Vec2::new(9.5, 0.0),
+            vel: Vec2::ZERO,
+            mass: 1.0,
+        };
+        let crossing = Victim {
+            start: Vec2::new(7.7, 0.0),
+            end: Vec2::new(10.8, 0.0),
+            vel: Vec2::new(186.0, 0.0),
+            mass: 1.0,
+        };
+        assert_eq!(plough(&parked, &crossing), Some(Plough::Mutual));
     }
 
     #[test]
