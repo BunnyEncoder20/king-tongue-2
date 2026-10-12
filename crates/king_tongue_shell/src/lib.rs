@@ -6,8 +6,11 @@
 
 // The mechanism that stops a new entity silently failing to render. Adding a
 // `BodyKind` variant breaks the match in `draw_body`, and these lints forbid
-// papering over that break with a catch-all arm. CI runs clippy with
-// `-D warnings`, so they are a build failure rather than advice.
+// papering over that break with a catch-all arm. They are only a build failure
+// rather than advice because CI lints the whole workspace with `-D warnings`;
+// until that step was widened it ran `-p king_tongue_sim` and never reached
+// this crate, so the guard was half-wired. Keep the two in step: a crate-scoped
+// clippy step turns these back into comments.
 //
 // Both lints, and the second is not redundant: ticket #20 checked this guard by
 // adding a variant and trying to silence the break, and found that
