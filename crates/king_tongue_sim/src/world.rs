@@ -3559,6 +3559,147 @@ mod tests {
         /// 1 Enemy's tension and half of a mass 2 Enemy's.
         const THROW_DISTANCE: f32 = 14.0;
 
+        /// Throws the one Enemy in a `yank` fixture and answers with the world
+        /// on the tick it became Thrown, still Attached.
+        fn thrown_enemy(mass: f32) -> (World, EntityId) {
+            let mut world = World::from_level(&yank(THROW_DISTANCE, mass));
+            let enemy = enemy_of(&world);
+            tap(&mut world, 1, Vec2::new(THROW_DISTANCE, 0.0));
+            world.step();
+            assert_eq!(
+                kind_of(&world, enemy),
+                Some(BodyKind::Thrown),
+                "the fixture must Throw the Enemy"
+            );
+            (world, enemy)
+        }
+
+        #[test]
+        fn releasing_a_thrown_enemy_slings_it_on_a_ballistic_arc() {
+            // ADR-0011: "Releasing the Tongue slings it into a ballistic arc on
+            // its residual velocity." Ballistic is a checkable claim rather
+            // than a description: with the slot cleared the only force left on
+            // the body is gravity, so one tick of its motion is the analytic
+            // one and nothing of the spring survives into it.
+            let (mut world, enemy) = thrown_enemy(1.0);
+
+            // ADR-0006: the finger that fired still owns slot 0, so it gives up
+            // ownership first and the next tap lands on that slot and Releases
+            // it. A Release costs nothing and is instant, per ADR-0012.
+            lift(&mut world, 1);
+            tap(&mut world, 2, Vec2::new(THROW_DISTANCE, 0.0));
+
+            let before = world.snapshot().body(enemy).expect("alive").pos;
+            let residual = world.body_velocity(enemy).expect("alive");
+            // It really is carrying something, or "on its residual velocity"
+            // would be satisfied by a body that had stopped dead.
+            assert!(
+                residual.x < -1.0,
+                "the Throw must leave the Enemy real momentum, got {residual:?}"
+            );
+            world.step();
+
+            // Velocity Verlet under a constant acceleration is exact: both
+            // evaluations see the same gravity, so the velocity step is
+            // `0.5 * (g + g) * DT` and the position step is
+            // `v * DT + 0.5 * g * DT^2`. The bound is float rounding in those
+            // two expressions and nothing else.
+            let after = world.snapshot().body(enemy).expect("alive").pos;
+            let v = world.body_velocity(enemy).expect("alive");
+            let expected_v = residual + GRAVITY * DT;
+            let expected_p = before + residual * DT + 0.5 * GRAVITY * DT * DT;
+            assert!(
+                (v - expected_v).length() < 1e-6,
+                "a Released Enemy accelerated by something other than gravity: \
+                 {v:?} against the ballistic {expected_v:?}"
+            );
+            assert!(
+                (after - expected_p).length() < 1e-6,
+                "a Released Enemy moved to {after:?} against the ballistic {expected_p:?}"
+            );
+            // The second tap really Released rather than re-firing, asserted
+            // where a player would see it: the slot is absent from the
+            // `Snapshot`, which is the whole of what a Release looks like.
+            assert!(
+                world.snapshot().tongues.is_empty(),
+                "the second tap must Release rather than re-fire: {:?}",
+                world.snapshot().tongues
+            );
+            // And it stays a weapon. Nothing demotes a Thrown Enemy: the state
+            // is terminal, which is what makes a slung Enemy still destroy what
+            // it lands among.
+            assert_eq!(kind_of(&world, enemy), Some(BodyKind::Thrown));
+        }
+
+        #[test]
+        fn an_unreleased_thrown_enemy_barrels_back_toward_the_hero() {
+            // ADR-0011's other half: "If the player does not Release, it
+            // barrels back toward the hero." The Released run above is the
+            // control, and the discriminator is the **acceleration** rather
+            // than the direction of travel: a Thrown Enemy's residual velocity
+            // already points at the hero at the moment of Release, so both runs
+            // close the gap and only the held one keeps gaining on it.
+            //
+            // The Tongue is horizontal and gravity has no x component at all,
+            // so x alone separates the two cases exactly.
+            const WINDOW: u32 = 5;
+            let closing_speeds = |release: bool| -> Vec<f32> {
+                let (mut world, enemy) = thrown_enemy(1.0);
+                if release {
+                    lift(&mut world, 1);
+                    tap(&mut world, 2, Vec2::new(THROW_DISTANCE, 0.0));
+                }
+                (0..WINDOW)
+                    .map(|_| {
+                        world.step();
+                        // Toward the hero is negative x in this fixture, so a
+                        // positive closing speed is the Enemy coming back.
+                        -world.body_velocity(enemy).expect("alive").x
+                    })
+                    .collect()
+            };
+
+            let held = closing_speeds(false);
+            let released = closing_speeds(true);
+
+            // Held: it gains on the hero every single tick.
+            for pair in held.windows(2) {
+                assert!(
+                    pair[1] > pair[0],
+                    "an unreleased Thrown Enemy stopped gaining on the hero: {held:?}"
+                );
+            }
+            // Released: no horizontal force exists, so the closing speed is
+            // constant to the bit. This is the mutation that makes the
+            // assertion above mean something: without it, a run where the
+            // Tongue had quietly stayed Attached would look identical.
+            for speed in &released {
+                assert!(
+                    (speed - released[0]).abs() < 1e-6,
+                    "a Released Enemy changed its closing speed: {released:?}"
+                );
+            }
+            assert!(
+                held[WINDOW as usize - 1] > released[WINDOW as usize - 1] * 2.0,
+                "holding the Tongue must build real closing speed: {held:?} against {released:?}"
+            );
+
+            // And the gap really closes, which is the player-visible half of
+            // the claim rather than a statement about velocities.
+            let (mut world, enemy) = thrown_enemy(1.0);
+            let gap =
+                |w: &World| (w.snapshot().body(enemy).expect("alive").pos - hero(w).pos).length();
+            let start = gap(&world);
+            for _ in 0..WINDOW {
+                world.step();
+            }
+            assert!(
+                gap(&world) < start - 0.5,
+                "the Enemy did not barrel back: {start} then {}",
+                gap(&world)
+            );
+        }
+
         /// A hero, a projectile Enemy [`THROW_DISTANCE`] along the x axis, and
         /// a second Enemy parked far above the scene until a test places it.
         ///
