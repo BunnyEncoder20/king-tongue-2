@@ -43,7 +43,11 @@ Linear interpolation of angles is wrong across the wrap boundary: blending 359 d
 
 ## A new entity cannot silently fail to render
 
-This was the ticket's original question and it is answered mechanically. `BodyKind` is a plain enum and the Shell's `draw_body` matches it exhaustively with no catch-all arm, so adding a variant is a compile error. Verified by adding a `Projectile` variant, which produced `error[E0004]: non-exhaustive patterns: BodyKind::Projectile not covered`. The Shell additionally sets `clippy::wildcard_enum_match_arm` and CI runs clippy with `-D warnings`, so silencing the break with `_ =>` is also a build failure.
+This was the ticket's original question and it is answered mechanically. `BodyKind` is a plain enum and the Shell's `draw_body` matches it exhaustively with no catch-all arm, so adding a variant is a compile error. Verified by adding a `Projectile` variant, which produced `error[E0004]: non-exhaustive patterns: BodyKind::Projectile not covered`, and re-verified on ticket #20 with a fourth variant against the completed `Thrown` match.
+
+The Shell additionally warns on `clippy::wildcard_enum_match_arm` **and** on `clippy::match_wildcard_for_single_variants`, and CI runs clippy with `-D warnings`, so silencing the break with `_ =>` is also a build failure.
+
+Both lints are needed, which this ADR originally got wrong by naming only the first. Ticket #20 checked the guard by adding one variant and then trying to silence the break, and `wildcard_enum_match_arm` did not fire: clippy reports a wildcard that covers exactly **one** missing variant under `match_wildcard_for_single_variants` instead, which lives in the `pedantic` group and is off by default. One missing variant is the case that actually arises, because a ticket adds one entity at a time, so as written the guard covered adding two entities and nothing else. Both lints are now set, and both halves are verified: without a catch-all arm the Shell fails with `E0004`, and with one it fails clippy.
 
 ## Consequences
 
