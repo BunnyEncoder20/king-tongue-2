@@ -498,9 +498,14 @@ impl World {
         let from = hero.pos;
         // Borrowed as an iterator rather than collected, so a tap allocates
         // nothing. Only `Enemy` bodies are targets: the hero cannot Attach to
-        // itself, and ADR-0011's `Thrown` state has nothing that produces it
-        // yet, so whether a Thrown Enemy is grappable is a later ticket's
-        // decision and not one to guess at here.
+        // itself, and ADR-0015 decides that a Thrown Enemy is not a target
+        // either. A weapon in flight is not grappable, so a filter that was
+        // waiting on that question is now the filter that answers it.
+        //
+        // It forbids re-targeting and nothing else. A Tongue already Attached
+        // to an Enemy that becomes Thrown keeps holding it, which is what makes
+        // ADR-0011's "if the player does not Release, it barrels back toward the
+        // hero" possible at all.
         let targets = self
             .bodies
             .iter()
@@ -3559,6 +3564,165 @@ mod tests {
         /// 1 Enemy's tension and half of a mass 2 Enemy's.
         const THROW_DISTANCE: f32 = 14.0;
 
+        #[test]
+        fn a_change_of_kind_snaps_rather_than_blending() {
+            // ADR-0002 keeps discrete events out of interpolation, and an Enemy
+            // becoming Thrown is exactly one: there is no state between a
+            // target and a weapon, so a blend would draw a body that is half of
+            // each for most of a frame.
+            //
+            // Asserted over a real pair of `Snapshot`s from a real promotion
+            // rather than a hand-built pair, because the thing that can be
+            // wrong is whether the two snapshots the Shell is handed differ in
+            // kind at all.
+            let mut world = World::from_level(&yank(THROW_DISTANCE, 1.0));
+            let enemy = enemy_of(&world);
+            tap(&mut world, 1, Vec2::new(THROW_DISTANCE, 0.0));
+            world.step();
+
+            let previous = world.previous_snapshot().clone();
+            assert_eq!(
+                previous.body(enemy).expect("alive").kind,
+                BodyKind::Enemy,
+                "the fixture must straddle the promotion, or nothing snaps"
+            );
+            assert_eq!(
+                world.snapshot().body(enemy).expect("alive").kind,
+                BodyKind::Thrown
+            );
+
+            let mut view = Snapshot::default();
+            crate::frame::interpolate_into(&previous, world.snapshot(), 0.5, &mut view);
+            let drawn = *view.body(enemy).expect("alive");
+            let current = *world.snapshot().body(enemy).expect("alive");
+            assert_eq!(
+                drawn.kind,
+                BodyKind::Thrown,
+                "a half-interpolated frame must already draw the weapon"
+            );
+            assert_eq!(
+                drawn.pos, current.pos,
+                "the kind changed, so the body must snap to its current position"
+            );
+
+            // Vacuity guard, and it is the whole test: on a tick where the kind
+            // did *not* change, the very same call blends. Without this the
+            // assertion above would pass for an implementation that never
+            // interpolated anything at all.
+            let before = *world.snapshot().body(enemy).expect("alive");
+            world.step();
+            let mut blended = Snapshot::default();
+            crate::frame::interpolate_into(
+                world.previous_snapshot(),
+                world.snapshot(),
+                0.5,
+                &mut blended,
+            );
+            let midpoint = *blended.body(enemy).expect("alive");
+            let now = *world.snapshot().body(enemy).expect("alive");
+            assert_eq!(now.kind, BodyKind::Thrown, "both ticks are Thrown now");
+            assert!(
+                (midpoint.pos - before.pos.lerp(now.pos, 0.5)).length() < 1e-6
+                    && (midpoint.pos - now.pos).length() > 1e-6,
+                "two ticks of the same kind must blend: {midpoint:?} between \
+                 {before:?} and {now:?}"
+            );
+        }
+
+        /// The `yank` scene with a wall beyond the Enemy, for asking what a tap
+        /// Attaches to once the Enemy has become a weapon.
+        ///
+        /// The wall sits past the Enemy and is tall, so a tap along the axis
+        /// meets the Enemy first while the terrain behind it is a genuine
+        /// alternative rather than empty sky.
+        fn yank_against_a_wall(enemy_mass: f32) -> Level {
+            let mut level = yank(THROW_DISTANCE, enemy_mass);
+            level.static_terrain.push(Aabb::new(
+                Vec2::new(THROW_DISTANCE + 6.5, 0.0),
+                Vec2::new(0.5, 20.0),
+            ));
+            level.validate().expect("fixture must be a valid level");
+            level
+        }
+
+        #[test]
+        fn a_thrown_enemy_is_no_longer_a_target_and_a_tracking_one_still_is() {
+            // ADR-0015's first decision: a weapon in flight cannot be grappled.
+            // The two runs differ in the Enemy's mass alone, so the second is
+            // the mutation of the first: at mass 1 the Enemy is Thrown when the
+            // second Gesture goes out and at mass 2 it is still a target, and
+            // the tap, the aim and the scene are otherwise identical.
+            let second_anchor = |enemy_mass: f32| -> (Anchor, EntityId, Vec2, Vec2) {
+                let mut world = World::from_level(&yank_against_a_wall(enemy_mass));
+                let enemy = enemy_of(&world);
+                tap(&mut world, 1, Vec2::new(THROW_DISTANCE, 0.0));
+                world.step();
+
+                // The first finger stays down, which ADR-0006 makes the only
+                // way to hold two Tongues: a lift and a second tap would come
+                // back to slot 0 and Release it instead.
+                let aim = Vec2::new(THROW_DISTANCE, 0.0) - hero(&world).pos;
+                touch_frame(
+                    &mut world,
+                    &[
+                        (1, TouchPhase::Stationary, aim),
+                        (2, TouchPhase::Started, aim),
+                    ],
+                );
+                let from = hero(&world).pos;
+                world.step();
+
+                // Slot 0's link is untouched either way: this decision forbids
+                // re-targeting a weapon, not holding one that is already held.
+                assert_eq!(
+                    world
+                        .snapshot()
+                        .tongues
+                        .iter()
+                        .find(|t| t.slot == 0)
+                        .map(|t| t.anchor),
+                    Some(Anchor::Movable(enemy)),
+                    "the Tongue already Attached must survive at Enemy mass {enemy_mass}"
+                );
+                let second = world
+                    .snapshot()
+                    .tongues
+                    .iter()
+                    .find(|t| t.slot == 1)
+                    .map(|t| t.anchor)
+                    .expect("the second Gesture must Attach to something");
+                (second, enemy, from, aim)
+            };
+
+            // Thrown: the tap reaches straight past the weapon to the terrain
+            // behind it, at exactly the point a pure cast finds. Bit-identical,
+            // because a filter that merely deprioritised a Thrown Enemy rather
+            // than removing it from the target set would differ in the last few
+            // bits of nothing else.
+            let (thrown_anchor, _, from, aim) = second_anchor(1.0);
+            // The same origin and the same aim the tap itself used, so the two
+            // casts differ in nothing but whether the Enemy was a candidate.
+            let pure = crate::tongue::cast(from, aim, &yank_against_a_wall(1.0).static_terrain)
+                .expect("the ray meets the wall");
+            match thrown_anchor {
+                Anchor::Fixed(p) => assert!(
+                    p.x.to_bits() == pure.x.to_bits() && p.y.to_bits() == pure.y.to_bits(),
+                    "a tap past a Thrown Enemy landed at {p:?} and not at the pure {pure:?}"
+                ),
+                other => panic!("a Thrown Enemy must not be grappable, got {other:?}"),
+            }
+
+            // Tracking: the same tap prefers the Enemy, which is what makes the
+            // run above a statement about the Thrown state rather than about
+            // this fixture's geometry.
+            let (tracking_anchor, enemy, _, _) = second_anchor(2.0);
+            assert_eq!(
+                tracking_anchor,
+                Anchor::Movable(enemy),
+                "an Enemy that is still a target must still be preferred"
+            );
+        }
+
         /// Throws the one Enemy in a `yank` fixture and answers with the world
         /// on the tick it became Thrown, still Attached.
         fn thrown_enemy(mass: f32) -> (World, EntityId) {
@@ -3909,6 +4073,126 @@ mod tests {
             assert!(
                 world.body_velocity(hero).expect("hero").x > 0.0,
                 "the hero must still be carrying its own pull"
+            );
+        }
+
+        #[test]
+        fn a_thrown_enemys_kill_does_not_count_toward_the_combo() {
+            // ADR-0015's second decision. The Combo is an unbroken run of
+            // Slams, and the GLOSSARY makes a Slam the outcome of **the player
+            // colliding** with an Enemy: when a Thrown Enemy destroys a lesser
+            // one the player caused it but did not collide with it, and spent
+            // none of their own momentum doing it.
+            //
+            // The control is the same scene, the same victim and the same
+            // death, differing only in who delivered it, which is exactly the
+            // distinction the decision turns on.
+            let (world, _, victim) = strike(0.5, IN_THE_PATH);
+            assert_eq!(
+                kind_of(&world, victim),
+                None,
+                "the fixture must land the Thrown kill"
+            );
+            assert_eq!(
+                world.snapshot().combo,
+                0,
+                "a Thrown Enemy's kill must not count as a Slam"
+            );
+
+            // The vacuity guard, and it is doing real work: a scene that could
+            // not raise the count at all would satisfy the assertion above for
+            // the wrong reason. Here the hero itself drives into the very same
+            // body and the very same tick's machinery counts it.
+            let mut control = World::from_level(&firing_line(0.5));
+            let hero_id = control.hero_id();
+            let victim_id = control
+                .snapshot()
+                .bodies
+                .iter()
+                .find(|b| b.pos.y > 1.0)
+                .map(|b| b.id)
+                .expect("the fixture parks its victim above the scene");
+            let at = control.snapshot().body(victim_id).expect("alive").pos;
+            control.place(
+                hero_id,
+                at - Vec2::new(2.0, 0.0),
+                Vec2::new(PROJECTILE_SPEED, 0.0),
+            );
+            control.step();
+            assert_eq!(
+                control.snapshot().combo,
+                1,
+                "the hero's own collision with the same body must count"
+            );
+        }
+
+        #[test]
+        fn the_hero_passes_through_a_thrown_enemy_because_hero_death_is_deferred() {
+            // **The deliberate gap, recorded as a test.** ADR-0011 says a
+            // Thrown Enemy striking the hero destroys the hero outright, and
+            // the hero's fail state, any lose condition, run structure and
+            // restart are all deferred in the map's fog, so there is nothing
+            // for that branch to trigger. Ticket #18 therefore leaves it out
+            // and this pins what happens instead: nothing at all.
+            //
+            // Not a Kick, deliberately. ADR-0011 makes the state the arbiter of
+            // what an Enemy striking the hero does, and a Kick is what the
+            // *tracking* state does; implementing one here would contradict the
+            // ADR rather than defer to it. The seam is the `BodyKind::Enemy`
+            // filter in `resolve_impacts` and the one in `resolve_thrown`, and
+            // whoever implements the fail state writes the branch there.
+            //
+            // The control is the same collision against a tracking Enemy, which
+            // is the only thing that makes "nothing happened" a measurement:
+            // the identical geometry at Enemy mass 2 is a Slam.
+            let collide = |enemy_mass: f32| -> (World, EntityId, u32) {
+                let mut world = World::from_level(&yank(THROW_DISTANCE, enemy_mass));
+                let enemy = enemy_of(&world);
+                tap(&mut world, 1, Vec2::new(THROW_DISTANCE, 0.0));
+                world.step();
+                let at = world.snapshot().body(enemy).expect("alive").pos;
+                let hero_id = world.hero_id();
+                world.place(
+                    hero_id,
+                    at - Vec2::new(2.0, 0.0),
+                    Vec2::new(PROJECTILE_SPEED, 0.0),
+                );
+                world.step();
+                let combo = world.snapshot().combo;
+                (world, enemy, combo)
+            };
+
+            let (thrown, weapon, thrown_combo) = collide(1.0);
+            assert_eq!(
+                kind_of(&thrown, weapon),
+                Some(BodyKind::Thrown),
+                "the fixture must drive the hero into a Thrown Enemy"
+            );
+            assert!(
+                thrown.snapshot().body(thrown.hero_id()).is_some(),
+                "the hero must survive, because nothing may destroy it yet"
+            );
+            assert_eq!(
+                thrown_combo, 0,
+                "a weapon in flight is not a target, so there is no Slam to count"
+            );
+            // The hero carries straight on: no Kick impulse reversed it, which
+            // is what a tracking Enemy would have done at low speed and what
+            // the ADR reserves for the tracking state.
+            assert!(
+                thrown.body_velocity(thrown.hero_id()).expect("hero").x > 0.0,
+                "the hero was repelled by a weapon it should have passed through"
+            );
+
+            let (tracking, target, tracking_combo) = collide(2.0);
+            assert_eq!(
+                kind_of(&tracking, target),
+                Some(BodyKind::Enemy),
+                "the control must stay in the tracking band"
+            );
+            assert_eq!(
+                tracking_combo, 1,
+                "the identical collision against a target must register a Slam"
             );
         }
 
