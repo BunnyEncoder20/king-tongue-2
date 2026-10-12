@@ -61,6 +61,14 @@ pub struct Pulls {
 
 impl Pulls {
     /// Adds a pull toward a point that does not move. Terrain, in other words.
+    ///
+    /// Test scaffolding, gated like [`crate::level::Level::from_ascii`] so it
+    /// cannot reach a build that ships. `World` resolves every Anchor to a
+    /// point **and that point's own velocity** before building a `Pulls`, so it
+    /// always has a velocity to hand and always calls [`Pulls::push_moving`];
+    /// a Fixed Anchor's velocity is simply zero. This is the convenience a
+    /// force test wants when it is writing the Anchor itself.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn push(&mut self, point: Vec2, strength: f32) {
         self.push_moving(point, Vec2::ZERO, strength);
     }

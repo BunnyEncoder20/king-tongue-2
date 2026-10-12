@@ -52,11 +52,20 @@ pub const PASS_THROUGH_MOMENTUM: f32 = 150.0;
 pub const MAX_DRAIN_FRACTION: f32 = 0.5;
 
 /// Where a swept circle first meets a box, and the surface direction there.
+///
+/// Only `normal` survives into a shipping build. `t` and `pos` are the geometry
+/// the sweep works in and nothing downstream of [`resolve_contact`] reads
+/// either: the gate is the normal, the impulse is along the normal, and no band
+/// cares where along the motion the meeting happened. They are kept for the
+/// tests that assert the sweep found the right point, gated like
+/// [`crate::level::Level::from_ascii`] so they cannot reach a build that ships.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Contact {
     /// Fraction of the motion at which contact happens, in `0.0..=1.0`.
+    #[cfg(any(test, feature = "test-util"))]
     pub t: f32,
     /// The circle's centre at contact.
+    #[cfg(any(test, feature = "test-util"))]
     pub pos: Vec2,
     /// Unit normal, pointing out of the box toward the circle.
     pub normal: Vec2,
@@ -136,6 +145,14 @@ impl Resolution {
 
     /// Whether this resolution emptied the `Toughness` pool. GLOSSARY: reaching
     /// zero destroys the Enemy.
+    ///
+    /// Test scaffolding, gated like [`crate::level::Level::from_ascii`] so it
+    /// cannot reach a build that ships. `World::resolve_impacts` writes the
+    /// pool back and lets its own single `retain(|b| b.toughness > 0.0)` decide,
+    /// which is how destruction stays one rule; a second reading of the same
+    /// condition on the shipping surface is something that rule could come to
+    /// disagree with.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn destroyed(&self) -> bool {
         self.toughness <= 0.0
     }
@@ -262,7 +279,9 @@ pub fn swept_contact(start: Vec2, motion: Vec2, radius: f32, target: Aabb) -> Op
     // (an Enemy is not terrain), but the contact still has to be reported.
     if overlaps(start, radius, target) {
         return Some(Contact {
+            #[cfg(any(test, feature = "test-util"))]
             t: 0.0,
+            #[cfg(any(test, feature = "test-util"))]
             pos: start,
             normal: surface_normal(start, target),
         });
@@ -310,7 +329,9 @@ pub fn swept_contact(start: Vec2, motion: Vec2, radius: f32, target: Aabb) -> Op
     first.map(|t| {
         let pos = start + motion * t;
         Contact {
+            #[cfg(any(test, feature = "test-util"))]
             t,
+            #[cfg(any(test, feature = "test-util"))]
             pos,
             normal: surface_normal(pos, target),
         }

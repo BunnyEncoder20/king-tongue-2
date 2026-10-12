@@ -468,6 +468,14 @@ impl World {
     }
 
     /// Hooke's `k` for the hero's Tongues.
+    ///
+    /// Test scaffolding, gated like [`World::place`] and
+    /// [`crate::level::Level::from_ascii`] so it cannot reach a build that
+    /// ships. Nothing in the game reads the knob back: the Shell never asks,
+    /// and inside the Core Sim the field is read directly. What this exists for
+    /// is letting a test predict a force analytically from the same `k` the
+    /// simulation used, rather than restating the constant beside it.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn hero_pull_strength(&self) -> f32 {
         self.hero_pull_strength
     }
@@ -480,8 +488,14 @@ impl World {
     /// `REST_LENGTH + m*g/k` as `k` varies, which is the measurable claim
     /// ADR-0003 makes.
     ///
+    /// Gated for that reason: it is a test knob and not a game rule, so it
+    /// follows the same convention as [`World::place`]. When device tuning
+    /// becomes real it will arrive as level or archetype data and not as a
+    /// setter the Shell reaches for.
+    ///
     /// Values at or above [`crate::max_stable_pull_strength`] diverge under any
     /// integrator at the locked `DT` and reopen ADR-0002 rather than ADR-0007.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_hero_pull_strength(&mut self, pull_strength: f32) {
         self.hero_pull_strength = pull_strength;
     }

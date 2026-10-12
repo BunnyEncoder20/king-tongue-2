@@ -108,8 +108,13 @@ where
     }
 }
 
-/// Frees every slot whose Movable Anchor has left the simulation, and reports
-/// how many it freed.
+/// Frees every slot whose Movable Anchor has left the simulation.
+///
+/// Reports nothing. It used to return the number of slots it freed, which only
+/// its own tests ever read: `World::step` calls this for its effect and ADR-0014
+/// makes a Release the clearing of a slot and nothing else, so there is no
+/// count for the tick to act on. The tests that care read it off the slots,
+/// which is the same claim checked against the thing that actually changed.
 ///
 /// ADR-0014: destruction forces a Release. The hero keeps whatever momentum it
 /// had, because a Release is only ever the clearing of a slot, and the slot is
@@ -119,16 +124,13 @@ where
 /// `alive` is asked by identity and never by slice position. A body that
 /// despawned must answer false, which is exactly what a lookup over the live
 /// body list does.
-pub fn release_dead_anchors(tongues: &mut Tongues, alive: impl Fn(EntityId) -> bool) -> usize {
-    let mut freed = 0;
+pub fn release_dead_anchors(tongues: &mut Tongues, alive: impl Fn(EntityId) -> bool) {
     for slot in tongues.iter_mut() {
         let dead = matches!(slot.map(|t| t.anchor), Some(Anchor::Movable(id)) if !alive(id));
         if dead {
             *slot = None;
-            freed += 1;
         }
     }
-    freed
 }
 
 #[cfg(test)]
@@ -407,8 +409,17 @@ mod tests {
                 anchor: Anchor::Fixed(Vec2::new(1.0, 2.0)),
             }),
         ];
-        let freed = release_dead_anchors(&mut tongues, |id| id != EntityId(3));
-        assert_eq!(freed, 1);
+        let claimed = |t: &Tongues| t.iter().filter(|slot| slot.is_some()).count();
+        let before = claimed(&tongues);
+        release_dead_anchors(&mut tongues, |id| id != EntityId(3));
+        // The count read off the slots rather than off the function's own
+        // report, so it is an independent reading of what changed and not the
+        // sweep agreeing with itself.
+        assert_eq!(
+            before - claimed(&tongues),
+            1,
+            "exactly one slot must have been freed"
+        );
         assert_eq!(tongues[0], None, "the dead Anchor's slot must be free");
         assert_eq!(
             tongues[1],
@@ -427,9 +438,9 @@ mod tests {
             }),
             None,
         ];
-        let before = live;
-        assert_eq!(release_dead_anchors(&mut live, |_| true), 0);
-        assert_eq!(live, before, "a live Anchor's slot was freed");
+        let untouched = live;
+        release_dead_anchors(&mut live, |_| true);
+        assert_eq!(live, untouched, "a live Anchor's slot was freed");
     }
 
     /// The rules that matter asserted where a player meets them: through the
