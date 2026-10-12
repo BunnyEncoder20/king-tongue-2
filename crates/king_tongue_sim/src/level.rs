@@ -39,6 +39,47 @@ impl Aabb {
         let d = (p - self.centre).abs();
         d.x <= self.half_extents.x && d.y <= self.half_extents.y
     }
+
+    /// The nearest way out of this box for a point inside it: how far that face
+    /// is, and the outward unit normal through it.
+    ///
+    /// The answer for a point with no outward direction to read off the
+    /// geometry, which is what a point strictly inside a box is. The shortest
+    /// way out is the only choice that does not teleport a body across the
+    /// level, and both collision paths that can reach the case need the same
+    /// answer: `crate::combat::surface_normal` wants the normal alone, and
+    /// `World`'s depenetration wants the distance too, to turn into a depth.
+    /// They computed it separately before this existed, with identical folds.
+    ///
+    /// **Ties break toward the lower x face**, because the faces are considered
+    /// in the order `-x, +x, -y, +y` and the comparison is strict. That matters
+    /// for a point at the exact centre of a square box, where all four
+    /// distances are equal, and it is arbitrary but fixed: ADR-0002 needs the
+    /// same input to give the same answer on every device, and "whichever face
+    /// the author happened to list first" is as deterministic as any other
+    /// rule.
+    ///
+    /// Not public: it answers a question only collision asks, and the Shell has
+    /// no business asking it.
+    pub(crate) fn nearest_face(&self, p: Vec2) -> (f32, Vec2) {
+        let to_min = p - self.min();
+        let to_max = self.max() - p;
+        [
+            (to_min.x, Vec2::NEG_X),
+            (to_max.x, Vec2::X),
+            (to_min.y, Vec2::NEG_Y),
+            (to_max.y, Vec2::Y),
+        ]
+        .iter()
+        .copied()
+        .fold((f32::INFINITY, Vec2::Y), |best, face| {
+            if face.0 < best.0 {
+                face
+            } else {
+                best
+            }
+        })
+    }
 }
 
 /// Where an Enemy starts, and how hard it is to destroy.
@@ -123,6 +164,34 @@ impl Level {
         for s in &self.enemy_spawns {
             if s.toughness <= 0.0 {
                 return Err(LevelError::Invalid("enemy toughness must be positive"));
+            }
+            // A Kick must not be able to kill. ADR-0011 gives a Kick fixed
+            // minimal damage because it is "a recoverable mistake, not a chip
+            // strategy", and `World` destroys on an emptied pool with one rule
+            // for every band, so an Enemy authored at or below
+            // [`crate::combat::KICK_DAMAGE`] would die to a single
+            // below-threshold bump.
+            //
+            // **This is no longer what enforces that rule.**
+            // [`crate::combat::kick_spend`] is, as a runtime invariant on the
+            // spend, and it has to be: load-time validation cannot defend a
+            // value that changes after load, and an Enemy authored at 3.0
+            // passes this check, takes a Slam of 2.5, survives at 0.5, and was
+            // then destroyed by one Kick. Ticket #15 rejected flooring the Kick
+            // as inventing combat math and directed this guard instead; the
+            // chipped pool is why that was wrong.
+            //
+            // Kept anyway, and worth keeping: it is an author-time error
+            // message that names the Enemy whose authored figure makes no
+            // sense, which a silent runtime floor does not. Same comparison as
+            // `kick_spend`, so the two cannot drift apart, and it includes the
+            // threshold because spending exactly the pool leaves zero and zero
+            // is destroyed.
+            if s.toughness <= crate::combat::KICK_DAMAGE {
+                return Err(LevelError::Invalid(
+                    "enemy toughness must exceed the Kick damage, or one \
+                     below-threshold Kick would destroy it",
+                ));
             }
             if s.mass <= 0.0 {
                 return Err(LevelError::Invalid("enemy mass must be positive"));
@@ -238,6 +307,40 @@ mod tests {
     }
 
     #[test]
+    fn the_nearest_face_out_of_a_box_is_the_shortest_way_and_ties_break_toward_lower_x() {
+        // Shared by `combat::surface_normal` and `World`'s depenetration, which
+        // held identical copies of this fold before it was extracted. Both
+        // inherit the tie-break, and neither had anything pinning it.
+        //
+        // A 10 by 2 box at the origin, so x and y are different lengths and a
+        // wrong axis cannot look right. Expected values read off the geometry
+        // rather than from the fold: from (3, 0.5), the faces are 8 away at
+        // -x, 2 at +x, 1.5 at -y and 0.5 at +y.
+        let box_ = Aabb::new(Vec2::ZERO, Vec2::new(5.0, 1.0));
+        assert_eq!(box_.nearest_face(Vec2::new(3.0, 0.5)), (0.5, Vec2::Y));
+        assert_eq!(box_.nearest_face(Vec2::new(3.0, -0.5)), (0.5, Vec2::NEG_Y));
+        assert_eq!(box_.nearest_face(Vec2::new(-4.0, 0.0)), (1.0, Vec2::NEG_X));
+        // A point nearer the long axis' face than either short one, so the
+        // answer really is the shortest way out and not a preferred axis.
+        assert_eq!(
+            box_.nearest_face(Vec2::new(4.75, 0.0)),
+            (0.25, Vec2::X),
+            "the shortest way out was not taken"
+        );
+
+        // The tie. At the exact centre of a square all four faces are equally
+        // near, and the fold's order decides. Arbitrary but fixed, which is
+        // what ADR-0002 needs: the same input must answer the same way on every
+        // device.
+        let square = Aabb::new(Vec2::new(7.0, -3.0), Vec2::splat(0.5));
+        assert_eq!(
+            square.nearest_face(square.centre),
+            (0.5, Vec2::NEG_X),
+            "a centred tie must break toward the lower x face"
+        );
+    }
+
+    #[test]
     fn aabb_bounds_round_trip() {
         let b = Aabb::new(Vec2::new(10.0, 5.0), Vec2::new(2.0, 3.0));
         assert_eq!(b.min(), Vec2::new(8.0, 2.0));
@@ -285,6 +388,48 @@ mod tests {
             mass: -1.0,
         }];
         assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_an_enemy_a_single_kick_could_destroy() {
+        // Ticket #15 calls a Kick "a recoverable mistake rather than a death",
+        // and ADR-0011 gives it fixed minimal damage for that reason. Nothing
+        // downstream enforces it: `World` has one destruction rule for
+        // everything (`retain(|b| b.toughness > 0.0)`), so an Enemy authored
+        // thin enough dies to one below-threshold bump, and because a Kick is
+        // not a Slam the Combo never records the kill. The guard has to be here,
+        // at load time, because this is the only place that sees the authored
+        // figure before play begins.
+        let kick_survivor = |toughness| {
+            let mut l = valid();
+            l.enemy_spawns = vec![EnemySpawn {
+                pos: Vec2::ZERO,
+                toughness,
+                mass: 1.0,
+            }];
+            l.validate().is_ok()
+        };
+
+        // The boundary, which is the case that matters: spending exactly the
+        // pool leaves zero, and zero is destroyed.
+        assert!(
+            !kick_survivor(crate::combat::KICK_DAMAGE),
+            "a pool a Kick empties exactly must be rejected"
+        );
+        assert!(
+            !kick_survivor(crate::combat::KICK_DAMAGE * 0.5),
+            "a pool one Kick overdraws must be rejected"
+        );
+        // And the other direction, so the guard is a boundary and not a ban on
+        // weak Enemies: anything a Kick leaves standing is authorable.
+        assert!(
+            kick_survivor(crate::combat::KICK_DAMAGE * 1.001),
+            "a pool that survives a Kick by a hair must be accepted"
+        );
+        assert!(
+            kick_survivor(100.0),
+            "an ordinary Enemy must still be authorable"
+        );
     }
 
     #[cfg(feature = "serde")]

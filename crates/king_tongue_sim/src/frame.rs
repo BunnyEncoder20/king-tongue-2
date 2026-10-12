@@ -6,7 +6,7 @@
 //! lives in the Core Sim rather than the Shell because it is deterministic logic
 //! with no platform content, so it is testable headless.
 
-use crate::{EntityId, DT};
+use crate::{Anchor, EntityId, DT};
 use glam::Vec2;
 
 /// The maximum number of Sim Ticks one frame may run.
@@ -58,9 +58,26 @@ impl Accumulator {
         if self.debt >= DT {
             // Over the ceiling. Keep only the sub-tick remainder so `alpha` stays
             // smooth, and account for what was thrown away.
+            //
+            // The remainder is taken with `%` rather than by subtracting
+            // `(debt / DT).floor() * DT`, and the counter saturates rather than
+            // adding, because both of those were defects a large enough delta
+            // reached. A frame time of `f32::MAX` makes `debt / DT` overflow to
+            // infinity, so the subtraction left `debt` at negative infinity and
+            // `feed` then returned zero ticks for the rest of the run: the
+            // simulation froze permanently and no later frame could restart it.
+            // Fixing that made the counter's overflow reachable in turn, since
+            // `inf as u64` saturates to `u64::MAX` and the next such frame
+            // added to it. `%` is exact at every magnitude and cannot leave the
+            // debt outside `0.0..DT`.
+            //
+            // Such a delta is not reachable from a sane clock, which is exactly
+            // what was said about the negative one this function already
+            // refuses. Guarding the input and letting the state go non-finite
+            // is half a guard.
             let discarded = (self.debt / DT).floor();
-            self.dropped_ticks += discarded as u64;
-            self.debt -= discarded * DT;
+            self.dropped_ticks = self.dropped_ticks.saturating_add(discarded as u64);
+            self.debt %= DT;
         }
 
         ticks
@@ -75,10 +92,13 @@ impl Accumulator {
 
 /// What kind of thing a body is, which decides how the Shell draws it.
 ///
-/// Adding a variant here is intended to break the Shell's match. The Shell sets
-/// `clippy::wildcard_enum_match_arm` to deny, so a catch-all arm cannot be used
-/// to silence that break, which is what stops a new entity silently failing to
-/// render.
+/// Adding a variant here is intended to break the Shell's match, with
+/// `error[E0004]`. The Shell also warns on `clippy::wildcard_enum_match_arm`
+/// **and** on `clippy::match_wildcard_for_single_variants`, and CI runs clippy
+/// with `-D warnings`, so a catch-all arm cannot be used to silence that break
+/// either. Both lints are needed: the first does not fire when the wildcard
+/// covers exactly one missing variant, which is the case a ticket adding one
+/// entity produces. See the comment at the top of the Shell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyKind {
     Hero,
@@ -108,10 +128,25 @@ pub struct TongueLine {
     pub slot: u8,
     pub from: Vec2,
     pub to: Vec2,
-    /// Identifies what the far end is attached to. Interpolation is only valid
-    /// while this is unchanged: if it differs between snapshots the Tongue was
-    /// re-fired, and blending would draw it sweeping across the level.
-    pub anchor_id: Option<EntityId>,
+    /// What the far end is Attached to. Interpolation is only valid while this
+    /// is unchanged: if it differs between snapshots the Tongue was re-fired,
+    /// and blending would draw it sweeping across the level.
+    ///
+    /// The whole [`Anchor`] and not just the body's id, which is a correction
+    /// rather than a convenience. An `Option<EntityId>` was `None` for *every*
+    /// Fixed Anchor, so two different terrain points compared equal and a slot
+    /// re-targeted from one surface to another blended between them. That was
+    /// unreachable while a slot held one Tongue for a whole run, and Release
+    /// made it reachable: the moment a second tap Releases and a third re-fires
+    /// at different terrain, the Tongue swept across the level.
+    ///
+    /// [`Anchor`] already distinguishes both cases correctly. `Fixed(a)` equals
+    /// `Fixed(b)` when the points agree, and `Movable(id)` compares by
+    /// identity, so a Tongue on a moving Enemy still interpolates while the
+    /// Enemy's position changes every tick. Comparing `to` instead would be
+    /// wrong for exactly that reason: it moves every tick for a Movable Anchor,
+    /// so it would snap on every single frame.
+    pub anchor: Anchor,
 }
 
 /// Everything the Shell needs to draw one Sim Tick. The Core Sim keeps the two
@@ -122,10 +157,25 @@ pub struct Snapshot {
     pub bodies: Vec<Body>,
     /// Only attached Tongues appear. An absent slot is not drawn at all.
     pub tongues: Vec<TongueLine>,
+    /// The Combo: how many Slams the current unbroken run is worth, zero when
+    /// there is no run. See [`crate::combo`].
+    ///
+    /// A count and not a score, per ADR-0011. This is how the Core Sim exposes
+    /// it for the Shell to read, and the Shell may draw it or derive a
+    /// multiplier from it; deciding anything simulated with it would be the
+    /// branching game logic ADR-0001 keeps out of the Shell.
+    pub combo: u32,
 }
 
 impl Snapshot {
-    fn body(&self, id: EntityId) -> Option<&Body> {
+    /// Finds a body by identity.
+    ///
+    /// Public because the Camera needs the hero's position out of an
+    /// *interpolated* snapshot, and the only honest way for the Shell to ask
+    /// that question is by the id the Core Sim hands it. Searching for
+    /// `BodyKind::Hero` in the Shell instead would put a game-logic branch
+    /// where ADR-0001 forbids one.
+    pub fn body(&self, id: EntityId) -> Option<&Body> {
         self.bodies.iter().find(|b| b.id == id)
     }
 
@@ -170,6 +220,11 @@ fn lerp_facing(a: Vec2, b: Vec2, t: f32) -> Vec2 {
 pub fn interpolate_into(previous: &Snapshot, current: &Snapshot, alpha: f32, out: &mut Snapshot) {
     let t = alpha.clamp(0.0, 1.0);
     out.tick = current.tick;
+    // Carried across unblended. A Combo is a count of hits, so a value between
+    // two of them does not exist: blending 3 toward 4 would draw 3.6 hits for
+    // most of a frame. ADR-0002 excludes discrete events from interpolation and
+    // a hit landing is exactly one.
+    out.combo = current.combo;
     out.bodies.clear();
     out.tongues.clear();
 
@@ -190,11 +245,11 @@ pub fn interpolate_into(previous: &Snapshot, current: &Snapshot, alpha: f32, out
 
     for cur in &current.tongues {
         let line = match previous.tongue(cur.slot) {
-            Some(prev) if prev.anchor_id == cur.anchor_id => TongueLine {
+            Some(prev) if prev.anchor == cur.anchor => TongueLine {
                 slot: cur.slot,
                 from: prev.from.lerp(cur.from, t),
                 to: prev.to.lerp(cur.to, t),
-                anchor_id: cur.anchor_id,
+                anchor: cur.anchor,
             },
             _ => *cur,
         };
@@ -266,13 +321,67 @@ mod tests {
     }
 
     #[test]
+    fn an_enormous_frame_delta_does_not_freeze_the_simulation_forever() {
+        // The regression this prevents froze the game permanently, and nothing
+        // caught it because every test fed a plausible number. A three minute
+        // suspend is 180 seconds and the test above it covers that; a clock
+        // that reports a very large delta instead used to leave the debt at
+        // negative infinity, because `(debt / DT).floor()` overflowed and the
+        // subtraction that followed had nothing finite to subtract. From that
+        // point `feed` returned zero ticks for every frame for the rest of the
+        // run. The AC this belongs to asks that the frame *after* an enormous
+        // one be normal, and for a large enough delta it never was again.
+        //
+        // The deltas below are not reachable from a working clock, which is
+        // precisely what is true of the negative delta this type already
+        // refuses on the grounds that clocks do go backwards. Validating the
+        // input and letting the state go non-finite is half a guard.
+        for delta in [180.0, 1e6, 1e20, 1e30, f32::MAX] {
+            let mut acc = Accumulator::new();
+            assert_eq!(
+                acc.feed(delta),
+                MAX_CATCHUP_TICKS,
+                "a delta of {delta:e} must run the clamped count and no more"
+            );
+            let alpha = acc.alpha();
+            assert!(
+                alpha.is_finite() && (0.0..=1.0).contains(&alpha),
+                "a delta of {delta:e} left alpha at {alpha}"
+            );
+            // The frame after it is an ordinary frame, which is the whole
+            // claim: one stalled frame costs simulated time and nothing else.
+            assert_eq!(
+                acc.feed(DT),
+                1,
+                "the frame after a delta of {delta:e} was not normal"
+            );
+            assert_eq!(acc.feed(DT), 1);
+            assert_eq!(acc.feed(DT * 3.0), 3);
+        }
+
+        // And it survives being fed the worst case repeatedly, which is the
+        // defect the fix above uncovered rather than introduced: the dropped
+        // count saturates at `u64::MAX`, and adding to it again overflowed.
+        // Unreachable while the debt was poisoned, because the poisoned debt
+        // never reached the counter a second time.
+        let mut acc = Accumulator::new();
+        for _ in 0..4 {
+            assert_eq!(acc.feed(f32::MAX), MAX_CATCHUP_TICKS);
+        }
+        assert_eq!(acc.dropped_ticks, u64::MAX, "the count must saturate");
+        assert_eq!(acc.feed(DT), 1, "and the clock must still work afterwards");
+    }
+
+    #[test]
     fn matched_bodies_interpolate() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![body(7, BodyKind::Hero, Vec2::new(0.0, 0.0))],
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![body(7, BodyKind::Hero, Vec2::new(10.0, 0.0))],
             tongues: vec![],
@@ -288,6 +397,7 @@ mod tests {
         // the hero's index shifts. Index matching would blend the hero against
         // the dead Enemy's position and slide it across the level.
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![
                 body(1, BodyKind::Enemy, Vec2::new(-100.0, 0.0)),
@@ -296,6 +406,7 @@ mod tests {
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![body(2, BodyKind::Hero, Vec2::new(2.0, 0.0))],
             tongues: vec![],
@@ -310,11 +421,13 @@ mod tests {
     #[test]
     fn spawned_body_does_not_slide_in_from_elsewhere() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![],
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![body(9, BodyKind::Enemy, Vec2::new(50.0, 50.0))],
             tongues: vec![],
@@ -331,11 +444,13 @@ mod tests {
     #[test]
     fn kind_change_snaps_because_it_is_a_discrete_event() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![body(4, BodyKind::Enemy, Vec2::new(0.0, 0.0))],
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![body(4, BodyKind::Thrown, Vec2::new(8.0, 0.0))],
             tongues: vec![],
@@ -349,18 +464,20 @@ mod tests {
     #[test]
     fn newly_fired_tongue_does_not_stretch_out_of_nowhere() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![],
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![],
             tongues: vec![TongueLine {
                 slot: 0,
                 from: Vec2::new(0.0, 0.0),
                 to: Vec2::new(30.0, 30.0),
-                anchor_id: None,
+                anchor: Anchor::Fixed(Vec2::new(30.0, 30.0)),
             }],
         };
         let mut out = Snapshot::default();
@@ -375,23 +492,25 @@ mod tests {
     #[test]
     fn retargeted_tongue_does_not_sweep_across_the_level() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![],
             tongues: vec![TongueLine {
                 slot: 0,
                 from: Vec2::ZERO,
                 to: Vec2::new(-500.0, 0.0),
-                anchor_id: Some(EntityId(1)),
+                anchor: Anchor::Movable(EntityId(1)),
             }],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![],
             tongues: vec![TongueLine {
                 slot: 0,
                 from: Vec2::ZERO,
                 to: Vec2::new(500.0, 0.0),
-                anchor_id: Some(EntityId(2)),
+                anchor: Anchor::Movable(EntityId(2)),
             }],
         };
         let mut out = Snapshot::default();
@@ -401,6 +520,124 @@ mod tests {
             Vec2::new(500.0, 0.0),
             "anchor changed, must snap"
         );
+    }
+
+    #[test]
+    fn retargeting_between_two_terrain_anchors_snaps() {
+        // The case an `Option<EntityId>` could not express at all: both of
+        // these are terrain, so both carried `None` and compared equal, and the
+        // Tongue blended a thousand units across the level. Unreachable while a
+        // slot held one Tongue forever; reachable the moment a tap can Release
+        // one and another can re-fire into the same slot.
+        let prev = Snapshot {
+            combo: 0,
+            tick: 1,
+            bodies: vec![],
+            tongues: vec![TongueLine {
+                slot: 0,
+                from: Vec2::ZERO,
+                to: Vec2::new(-500.0, 0.0),
+                anchor: Anchor::Fixed(Vec2::new(-500.0, 0.0)),
+            }],
+        };
+        let cur = Snapshot {
+            combo: 0,
+            tick: 2,
+            bodies: vec![],
+            tongues: vec![TongueLine {
+                slot: 0,
+                from: Vec2::ZERO,
+                to: Vec2::new(500.0, 0.0),
+                anchor: Anchor::Fixed(Vec2::new(500.0, 0.0)),
+            }],
+        };
+        let mut out = Snapshot::default();
+        interpolate_into(&prev, &cur, 0.5, &mut out);
+        assert_eq!(
+            out.tongues[0].to,
+            Vec2::new(500.0, 0.0),
+            "two different terrain Anchors must not compare equal"
+        );
+    }
+
+    #[test]
+    fn a_tongue_on_a_moving_anchor_keeps_interpolating_as_that_anchor_moves() {
+        // The other half of the predicate, and the reason the field is an
+        // `Anchor` rather than a comparison of `to`. A Tongue Attached to a
+        // moving Enemy has a far end that moves every single tick, so
+        // comparing endpoints would snap on every frame and the Tongue would
+        // judder for the whole time it was Attached. Identity is what is
+        // unchanged here, and identity is what must be compared.
+        let enemy = Anchor::Movable(EntityId(3));
+        let prev = Snapshot {
+            combo: 0,
+            tick: 1,
+            bodies: vec![],
+            tongues: vec![TongueLine {
+                slot: 0,
+                from: Vec2::ZERO,
+                to: Vec2::new(0.0, 0.0),
+                anchor: enemy,
+            }],
+        };
+        let cur = Snapshot {
+            combo: 0,
+            tick: 2,
+            bodies: vec![],
+            tongues: vec![TongueLine {
+                slot: 0,
+                from: Vec2::ZERO,
+                to: Vec2::new(10.0, 0.0),
+                anchor: enemy,
+            }],
+        };
+        let mut out = Snapshot::default();
+        interpolate_into(&prev, &cur, 0.5, &mut out);
+        assert_eq!(
+            out.tongues[0].to,
+            Vec2::new(5.0, 0.0),
+            "the same Enemy at a new position must blend, not snap"
+        );
+    }
+
+    #[test]
+    fn the_combo_count_is_carried_across_whole_rather_than_blended() {
+        // A Combo is a count of hits, so there is no value between two of them:
+        // blending three toward four would have the Shell draw 3.5 hits for
+        // half a frame. ADR-0002 keeps discrete events out of interpolation and
+        // a hit landing is exactly one, so the latest count is carried through
+        // untouched at every alpha.
+        let prev = Snapshot {
+            combo: 3,
+            tick: 1,
+            bodies: vec![],
+            tongues: vec![],
+        };
+        let cur = Snapshot {
+            combo: 4,
+            tick: 2,
+            bodies: vec![],
+            tongues: vec![],
+        };
+        let mut out = Snapshot::default();
+        for alpha in [0.0, 0.25, 0.5, 0.999, 1.0] {
+            interpolate_into(&prev, &cur, alpha, &mut out);
+            assert_eq!(
+                out.combo, 4,
+                "at alpha {alpha} the view must carry the current count"
+            );
+        }
+
+        // And a broken run reads as broken immediately, rather than fading out
+        // of the previous snapshot's count.
+        let broken = Snapshot {
+            combo: 0,
+            tick: 3,
+            bodies: vec![],
+            tongues: vec![],
+        };
+        interpolate_into(&cur, &broken, 0.5, &mut out);
+        assert_eq!(out.combo, 0, "a Combo that broke must read as broken");
     }
 
     #[test]
@@ -425,11 +662,13 @@ mod tests {
     #[test]
     fn interpolation_reuses_the_output_buffer() {
         let prev = Snapshot {
+            combo: 0,
             tick: 1,
             bodies: vec![],
             tongues: vec![],
         };
         let cur = Snapshot {
+            combo: 0,
             tick: 2,
             bodies: vec![body(1, BodyKind::Hero, Vec2::ZERO)],
             tongues: vec![],

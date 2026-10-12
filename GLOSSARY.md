@@ -51,7 +51,7 @@ An unbroken run of Slams, counted while the player is airborne and persisting ac
 _Avoid_: Streak, chain, multiplier, rally
 
 **Thrown**:
-The state of an Enemy that has lost control of its own momentum, having been pulled hard enough by a Tongue or struck hard enough to be weaponized. A Thrown Enemy destroys lesser Enemies it hits and is itself destroyed by terrain.
+The state of an Enemy that has lost control of its own momentum, having been pulled hard enough by a Tongue or struck hard enough to be weaponized. A Thrown Enemy destroys lesser Enemies it hits and is itself destroyed by terrain. It is no longer an Anchor: a Tongue already Attached keeps holding it, and no new one can be fired at it.
 _Avoid_: Vicious pull, wrecking ball, stunned, ragdoll
 
 **Enemy**:

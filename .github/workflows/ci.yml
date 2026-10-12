@@ -33,13 +33,27 @@ jobs:
       - name: Core Sim tests with ASCII test helper
         run: cargo test -p king_tongue_sim --features test-util
 
+      # The two optional features together, which is the combination the
+      # project's own gate runs. Each feature passing alone does not imply the
+      # pair compiles: a `cfg(any(test, feature = "test-util"))` item that
+      # names a serde-only type is only reachable when both are on.
+      - name: Core Sim tests with serde and the ASCII test helper
+        run: cargo test -p king_tongue_sim --features serde,test-util
+
       # A level file that stops parsing is a broken game, and it would
       # otherwise only surface by launching. ADR-0010.
       - name: Shipped level assets parse
         run: cargo run --example parse_check -p king_tongue_sim --features serde
 
       - run: cargo fmt --all --check
-      - run: cargo clippy -p king_tongue_sim --all-targets -- -D warnings
+
+      # The whole workspace, not just the Core Sim. The Shell carries
+      # `#![warn(clippy::match_wildcard_for_single_variants)]`, which is the
+      # half of ADR-0009's new-entity guard that stops someone silencing the
+      # broken `draw_body` match with a catch-all arm. A crate-scoped clippy
+      # step left that warning advisory, so narrowing this back to
+      # `-p king_tongue_sim` would unwire the guard again.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   android:
     name: Android cross-compile (both shipping ABIs)

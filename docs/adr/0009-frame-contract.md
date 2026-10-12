@@ -31,13 +31,23 @@ Four rules follow:
 
 Tongues interpolate only while the same slot is attached to the same anchor in both snapshots. A newly fired Tongue snaps, otherwise it is drawn stretching out of nowhere, and a re-fired one snaps, otherwise it sweeps across the level. ADR-0002 required that discrete events be excluded from interpolation, and this is where that is honoured.
 
+**A `TongueLine` carries the whole `Anchor`, and identifying a Fixed Anchor by a nullable body id is a defect.** The first implementation carried an `Option<EntityId>`, which is `None` for every Fixed Anchor, so two different terrain points compared equal and the predicate above could not tell them apart. That was harmless for exactly as long as a slot held one Tongue for a whole run, which is why ticket #12 shipped it. Release made it reachable: a second tap Releases, a third re-fires at different terrain, and the Tongue blended a room's width across the level. The `Anchor` enum already distinguishes both cases correctly, comparing `Fixed` by position and `Movable` by identity.
+
+Comparing the line's far endpoint instead would be wrong, and wrong in the opposite direction: that point moves every tick for a Tongue attached to a moving Enemy, so it would snap on every single frame and judder for the whole attachment. The two cases genuinely need different notions of sameness, position for terrain and identity for a body, and carrying the `Anchor` is what supplies both. Discovered while implementing ticket #13, and covered by a regression test that re-targets a slot between two terrain Anchors.
+
+The reachability argument generalises past Release. The Shell draws more frames than there are Sim Ticks, so it calls `apply_touches` more than once between one tick and the next. A frame that Releases and a frame that re-fires can therefore both fall inside a single tick, and then no `Snapshot` ever shows the slot empty: the slot goes straight from one Anchor to another and the empty-slot snap never gets a chance to save it.
+
 ## Facing is a unit vector, not an angle
 
 Linear interpolation of angles is wrong across the wrap boundary: blending 359 degrees toward 1 degree sweeps backwards through 180. The contract therefore carries facing as a unit vector and blends by lerp-then-renormalize, with a guard for the near-opposite case, which would otherwise normalize a near-zero vector into NaN. The Shell draws the vector directly and never reconstructs an angle through `atan2`.
 
 ## A new entity cannot silently fail to render
 
-This was the ticket's original question and it is answered mechanically. `BodyKind` is a plain enum and the Shell's `draw_body` matches it exhaustively with no catch-all arm, so adding a variant is a compile error. Verified by adding a `Projectile` variant, which produced `error[E0004]: non-exhaustive patterns: BodyKind::Projectile not covered`. The Shell additionally sets `clippy::wildcard_enum_match_arm` and CI runs clippy with `-D warnings`, so silencing the break with `_ =>` is also a build failure.
+This was the ticket's original question and it is answered mechanically. `BodyKind` is a plain enum and the Shell's `draw_body` matches it exhaustively with no catch-all arm, so adding a variant is a compile error. Verified by adding a `Projectile` variant, which produced `error[E0004]: non-exhaustive patterns: BodyKind::Projectile not covered`, and re-verified on ticket #20 with a fourth variant against the completed `Thrown` match.
+
+The Shell additionally warns on `clippy::wildcard_enum_match_arm` **and** on `clippy::match_wildcard_for_single_variants`, and CI runs clippy with `-D warnings`, so silencing the break with `_ =>` is also a build failure.
+
+Both lints are needed, which this ADR originally got wrong by naming only the first. Ticket #20 checked the guard by adding one variant and then trying to silence the break, and `wildcard_enum_match_arm` did not fire: clippy reports a wildcard that covers exactly **one** missing variant under `match_wildcard_for_single_variants` instead, which lives in the `pedantic` group and is off by default. One missing variant is the case that actually arises, because a ticket adds one entity at a time, so as written the guard covered adding two entities and nothing else. Both lints are now set, and both halves are verified: without a catch-all arm the Shell fails with `E0004`, and with one it fails clippy.
 
 ## Consequences
 

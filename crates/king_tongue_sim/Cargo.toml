@@ -17,6 +17,13 @@ glam = { workspace = true }
 serde = { workspace = true, optional = true }
 ron = { workspace = true, optional = true }
 
+# `parse_check` calls `Level::from_bytes`, which only exists with `serde` on.
+# Without this, `cargo test --no-default-features` fails building the example
+# rather than running the tests, which is how the boundary check masked itself.
+[[example]]
+name = "parse_check"
+required-features = ["serde"]
+
 [features]
 default = []
 # Level parsing. ADR-0001 permits a parser behind a feature flag; keeping it

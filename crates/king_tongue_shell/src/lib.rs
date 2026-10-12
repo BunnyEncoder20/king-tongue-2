@@ -5,10 +5,23 @@
 //! cargo-ndk plus a hand-owned Gradle shell. ADR-0009 fixes the frame contract.
 
 // The mechanism that stops a new entity silently failing to render. Adding a
-// `BodyKind` variant breaks the match in `draw_body`, and this lint forbids
-// papering over that break with a catch-all arm. CI runs clippy with
-// `-D warnings`, so it is a build failure rather than advice.
+// `BodyKind` variant breaks the match in `draw_body`, and these lints forbid
+// papering over that break with a catch-all arm. They are only a build failure
+// rather than advice because CI lints the whole workspace with `-D warnings`;
+// until that step was widened it ran `-p king_tongue_sim` and never reached
+// this crate, so the guard was half-wired. Keep the two in step: a crate-scoped
+// clippy step turns these back into comments.
+//
+// Both lints, and the second is not redundant: ticket #20 checked this guard by
+// adding a variant and trying to silence the break, and found that
+// `wildcard_enum_match_arm` does not fire when the wildcard covers exactly one
+// missing variant. Clippy reports that case under
+// `match_wildcard_for_single_variants` instead, which is a `pedantic` lint and
+// so off by default. One missing variant is the case that actually happens: a
+// ticket adds one `BodyKind` at a time. Without the second lint the first was
+// a guard against adding two entities and nothing else.
 #![warn(clippy::wildcard_enum_match_arm)]
+#![warn(clippy::match_wildcard_for_single_variants)]
 
 use king_tongue_sim as sim;
 use sim::{Accumulator, BodyKind, Snapshot};
@@ -30,8 +43,15 @@ pub extern "C" fn quad_main() {
     run();
 }
 
-/// World units per screen pixel at the default zoom.
-const PIXELS_PER_UNIT: f32 = 24.0;
+/// Screen pixels per world unit: the Camera's fixed zoom.
+///
+/// ADR-0013 deliberately leaves the zoom factor open and calls this constant a
+/// placeholder, so this is a bound and not an answer. The bound it has to meet
+/// is that the whole level is never visible at once. At 64 pixels per unit even
+/// a 3840 pixel wide window shows 60 world units across, while the shipped
+/// scene's terrain spans 82 and its Kill Bound 160, so the player always sees a
+/// slice. Lowering this below roughly 48 breaks that on a wide desktop monitor.
+const PIXELS_PER_UNIT: f32 = 64.0;
 
 /// Converts a Core Sim position into Macroquad screen space.
 ///
@@ -72,24 +92,117 @@ pub fn window_conf() -> macroquad::window::Conf {
     }
 }
 
-/// Draws one interpolated body.
+/// Draws one interpolated body, in the shape that actually collides.
 ///
 /// The match is deliberately exhaustive with no catch-all arm. That is the whole
-/// enforcement mechanism for "adding an entity cannot silently fail to render".
+/// enforcement mechanism for "adding an entity cannot silently fail to render",
+/// and it is why the shape is decided inside the same match as the tint rather
+/// than beside it: a new `BodyKind` has to answer both questions or fail to
+/// build.
+///
+/// **Per kind, because the collision shapes differ.** The hero is a bounding
+/// circle of `PLAYER_RADIUS`; an Enemy is a bounding box of
+/// `ENEMY_HALF_EXTENTS`. Drawing every body as a circle put hits up to about
+/// 0.21 units outside the drawn shape at an Enemy's corners, which is exactly
+/// what Placeholder Geometry exists not to do: the sketch has to mean what it
+/// looks like, or tuning is done against a lie.
+///
+/// A Thrown Enemy is drawn as the same box. It sweeps as its box's inscribed
+/// circle when it is the projectile, which is the approximation the integrator
+/// has made for every body since ticket #11, but it is still a box when it is
+/// the thing being struck, and the box is the outer of the two.
 fn draw_body(body: &sim::Body, origin: macroquad::math::Vec2) {
     use macroquad::color;
     let p = to_screen(body.pos, origin);
-    let r = sim::PLAYER_RADIUS * PIXELS_PER_UNIT;
-    let tint = match body.kind {
-        BodyKind::Hero => color::SKYBLUE,
-        BodyKind::Enemy => color::GRAY,
-        BodyKind::Thrown => color::ORANGE,
+    let (tint, half_extents) = match body.kind {
+        BodyKind::Hero => (color::SKYBLUE, None),
+        BodyKind::Enemy => (color::GRAY, Some(sim::combat::ENEMY_HALF_EXTENTS)),
+        BodyKind::Thrown => (color::ORANGE, Some(sim::combat::ENEMY_HALF_EXTENTS)),
     };
-    macroquad::shapes::draw_circle(p.x, p.y, r, tint);
+    match half_extents {
+        None => {
+            let r = sim::PLAYER_RADIUS * PIXELS_PER_UNIT;
+            macroquad::shapes::draw_circle(p.x, p.y, r, tint);
+        }
+        Some(half) => {
+            // Screen y grows downward, so a box's upper left on screen is its
+            // minimum x and its maximum y in the world. Same conversion as
+            // `draw_terrain`, which draws the other boxes in the scene.
+            let corner = to_screen(body.pos + glam::Vec2::new(-half.x, half.y), origin);
+            let size = half * 2.0 * PIXELS_PER_UNIT;
+            macroquad::shapes::draw_rectangle(corner.x, corner.y, size.x, size.y, tint);
+        }
+    }
     // Facing, drawn from the unit vector the contract carries rather than from an
     // angle, so it is never reconstructed through atan2 and re-wrapped.
     let tip = to_screen(body.pos + body.facing * sim::PLAYER_RADIUS * 1.8, origin);
     macroquad::shapes::draw_line(p.x, p.y, tip.x, tip.y, 2.0, color::WHITE);
+}
+
+/// Where world-space origin lands on screen so that the hero sits in the middle
+/// of it.
+///
+/// This is the whole Camera, and ADR-0013 puts it here rather than in the Core
+/// Sim because it is view state: it changes what the player sees and never what
+/// the simulation computes.
+///
+/// It reads the **interpolated** snapshot and not the tick state. Following the
+/// raw tick position judders visibly on a high refresh rate panel even though
+/// the simulation underneath is correct, because the Camera would then step at
+/// 60Hz while the panel draws at 120.
+///
+/// Stateless, which is what ADR-0013 decided: position straight from the hero
+/// every frame, no damping and no lookahead. The ADR records why taking the
+/// damped escape hatch later would be legitimate.
+pub fn camera_origin(
+    view: &Snapshot,
+    hero: sim::EntityId,
+    screen: macroquad::math::Vec2,
+) -> macroquad::math::Vec2 {
+    let centre = screen * 0.5;
+    // Inverting `to_screen` for the hero's position: whatever origin puts the
+    // hero at the centre of the screen. Routed **through** `to_screen` rather
+    // than restating its arithmetic backwards, so the transform lives in one
+    // place and the Camera cannot drift away from the thing that draws.
+    //
+    // What makes that possible is that the origin enters `to_screen` purely
+    // additively, so `to_screen(v, o)` is `to_screen(v, 0) + o` and the origin
+    // that lands `v` on `centre` is `centre - to_screen(v, 0)`. Checked to be
+    // bit-identical to the hand-inverted form over every screen centre a
+    // window can report, which is any non-negative pair: the two differ only
+    // in the sign of a zero, and only when the centre is itself negative zero.
+    //
+    // The fallback is reachable: the Kill Bound removes any body that leaves
+    // the level's `world_bounds`, the hero included, and a removed body is
+    // simply absent from the Snapshot. Drawing the world origin at the centre
+    // is the inert choice, and it stays a drawing fallback rather than a game
+    // rule: the Shell learns nothing about despawning and decides nothing
+    // because of it.
+    view.body(hero).map_or(centre, |body| {
+        centre - to_screen(body.pos, macroquad::math::Vec2::ZERO)
+    })
+}
+
+/// Draws the level's static terrain.
+///
+/// Terrain is not in the `Snapshot` because it never moves, so the Shell draws
+/// it straight from the `Level` it loaded. Without it the hero falls and lands
+/// in a black void with nothing to land on, which is a rendering gap and not a
+/// simulation one.
+fn draw_terrain(terrain: &[sim::Aabb], origin: macroquad::math::Vec2) {
+    for aabb in terrain {
+        // Screen y grows downward, so a box's upper left on screen is its
+        // minimum x and its maximum y in the world.
+        let corner = to_screen(glam::Vec2::new(aabb.min().x, aabb.max().y), origin);
+        let size = aabb.half_extents * 2.0 * PIXELS_PER_UNIT;
+        macroquad::shapes::draw_rectangle(
+            corner.x,
+            corner.y,
+            size.x,
+            size.y,
+            macroquad::color::DARKGRAY,
+        );
+    }
 }
 
 fn draw_frame(view: &Snapshot, origin: macroquad::math::Vec2) {
@@ -156,13 +269,30 @@ pub fn run() {
             level.enemy_spawns.len()
         );
 
+        // The Core Sim owns every piece of state from here on. The Shell holds
+        // the clock, the touch slots, the interpolation buffer, and the Camera,
+        // and nothing else.
+        let mut world = sim::World::from_level(&level);
+        let hero = world.hero_id();
+
         let mut accumulator = Accumulator::new();
-        // The two snapshots ADR-0002 requires, plus a reused interpolation buffer
-        // so rendering allocates nothing per frame.
-        let mut previous = Snapshot::default();
-        let mut current = Snapshot::default();
+        // Reused so rendering allocates nothing per frame. The two snapshots
+        // ADR-0002 requires live in the `World`, which keeps them in step with
+        // the ticks that produced them.
         let mut view = Snapshot::default();
-        let mut claimed: [Option<u64>; sim::MAX_TONGUES] = [None; sim::MAX_TONGUES];
+        // Likewise reused. Ten fingers is more than Android reports and far
+        // more than ADR-0006 can use.
+        let mut touches: Vec<sim::TouchSample> = Vec::with_capacity(10);
+
+        // The Camera origin a touch is converted through is the one that was on
+        // screen when the finger landed, which is last frame's. That is the
+        // honest answer rather than a convenience: the player aimed at what
+        // they could see, and the frame they aimed at has already been drawn.
+        let mut screen = macroquad::math::Vec2::new(
+            macroquad::window::screen_width(),
+            macroquad::window::screen_height(),
+        );
+        let mut origin = camera_origin(world.snapshot(), hero, screen);
 
         loop {
             // Wall-clock time enters the simulation here and nowhere else.
@@ -170,41 +300,70 @@ pub fn run() {
             // resume from suspend from running thousands of ticks in one frame.
             let ticks = accumulator.feed(macroquad::time::get_frame_time());
 
-            let _intents = poll_gestures(&mut claimed);
+            // Input enters the simulation here and nowhere else, and it enters
+            // raw. A Tongue fired now appears in the Snapshot the next Sim Tick
+            // writes, so it is drawn from the first tick it exists for.
+            collect_touches(origin, &mut touches);
+            world.apply_touches(&touches);
 
             for _ in 0..ticks {
-                // Rotate before stepping, so `previous` is always the tick before
-                // `current` and never the same tick.
-                core::mem::swap(&mut previous, &mut current);
-                // World stepping lands here. The Core Sim produces `current`.
-                current.tick = previous.tick.wrapping_add(1);
+                world.step();
             }
 
-            sim::frame::interpolate_into(&previous, &current, accumulator.alpha(), &mut view);
+            sim::frame::interpolate_into(
+                world.previous_snapshot(),
+                world.snapshot(),
+                accumulator.alpha(),
+                &mut view,
+            );
 
             macroquad::window::clear_background(macroquad::color::BLACK);
-            let origin = macroquad::math::Vec2::new(
-                macroquad::window::screen_width() * 0.5,
-                macroquad::window::screen_height() * 0.5,
+            screen = macroquad::math::Vec2::new(
+                macroquad::window::screen_width(),
+                macroquad::window::screen_height(),
             );
+            // The Camera follows the interpolated hero, per ADR-0013. Kept for
+            // the next frame's touch conversion as well as this frame's
+            // drawing, so a tap is read against the view it was aimed at.
+            origin = camera_origin(&view, hero, screen);
+            draw_terrain(&level.static_terrain, origin);
             draw_frame(&view, origin);
             macroquad::window::next_frame().await;
         }
     });
 }
 
-/// Reads the current touch set into Gesture intents.
+/// Converts Macroquad's touch set into the Core Sim's platform-neutral one.
 ///
-/// Three constraints confirmed by the ticket #2 research, each of which is a bug
-/// if ignored: `touches()` collects from a `HashMap` so iteration order is not
-/// stable between frames and entries must be keyed by `id` rather than by index;
-/// `Ended` and `Cancelled` are visible for exactly one frame; and a held finger
-/// reports `Stationary`, never `Moved`.
+/// This is the entire input job of the Shell, and the absence of anything else
+/// here is the point. Which finger claims which Tongue slot, what a third
+/// concurrent touch does, which surface a tap Attaches to, and whether a lifted
+/// finger Releases anything are all decisions behind `World::apply_touches`,
+/// where they are headless-testable. The spec makes that a standing constraint:
+/// the Shell is untested by design, so a conditional here that decided a game
+/// outcome would be a defect.
 ///
-/// Slot assignment: the first `Started` id claims a free slot, later ids take the
-/// second, and any third concurrent id is discarded per ADR-0006.
-pub fn poll_gestures(_claimed: &mut [Option<u64>; sim::MAX_TONGUES]) -> Vec<sim::GestureIntent> {
-    // Gesture state machine lands with the level data format work; the frame
-    // contract it hangs off is settled here.
-    Vec::new()
+/// What remains is platform conversion. The phase mapping is a rename between
+/// two identical enums, and the position mapping is screen pixels to world
+/// units through the Camera origin. Neither looks at game state.
+///
+/// Keyed by `id` and never by position in the set: `touches()` collects from a
+/// `HashMap`, so its iteration order is not stable between frames. Writing into
+/// a caller-owned buffer so polling allocates nothing per frame.
+pub fn collect_touches(origin: macroquad::math::Vec2, out: &mut Vec<sim::TouchSample>) {
+    use macroquad::input::TouchPhase as Mq;
+    out.clear();
+    for touch in macroquad::input::touches() {
+        out.push(sim::TouchSample {
+            id: touch.id,
+            phase: match touch.phase {
+                Mq::Started => sim::TouchPhase::Started,
+                Mq::Moved => sim::TouchPhase::Moved,
+                Mq::Stationary => sim::TouchPhase::Stationary,
+                Mq::Ended => sim::TouchPhase::Ended,
+                Mq::Cancelled => sim::TouchPhase::Cancelled,
+            },
+            pos: from_screen(touch.position, origin),
+        });
+    }
 }
