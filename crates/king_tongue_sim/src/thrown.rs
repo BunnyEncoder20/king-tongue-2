@@ -73,13 +73,30 @@ pub fn tension(tongue_force: Vec2, mass: f32) -> f32 {
     tongue_force.length() / mass
 }
 
+/// Whether a tension has taken a body's control of its own momentum away, which
+/// is to say whether it promotes an Enemy to Thrown.
+///
+/// **The single statement of ADR-0011's promotion boundary.** Everything that
+/// decides the promotion comes through here: [`exceeds_tension`] below for a
+/// force and a mass, and `World::resolve_thrown` for the tension its half-step
+/// already recorded. The two signatures differ because the tick has the scalar
+/// in hand and a pure caller has the force, and the comparison lived in both
+/// places before this function existed; one rule stated twice is one rule that
+/// can be retuned in one place and not the other.
+///
+/// At the threshold exactly it promotes: ADR-0011's bands are written "above
+/// the Kick threshold" and "at or above `toughness`", and this follows the
+/// second, because a boundary that belonged to neither side would be a band of
+/// its own.
+pub fn promotes(tension: f32) -> bool {
+    tension >= THROW_TENSION
+}
+
 /// Whether a body under `tongue_force` has lost control of its own momentum.
 ///
-/// At the threshold exactly it has: ADR-0011's bands are written "above the
-/// Kick threshold" and "at or above `toughness`", and this follows the second,
-/// because a boundary that belonged to neither side would be a band of its own.
+/// The force-and-mass form of [`promotes`], which holds the rule.
 pub fn exceeds_tension(tongue_force: Vec2, mass: f32) -> bool {
-    tension(tongue_force, mass) >= THROW_TENSION
+    promotes(tension(tongue_force, mass))
 }
 
 /// The circle a Thrown Enemy sweeps with.
@@ -314,6 +331,35 @@ mod tests {
         // `true` rather than as a panic.
         assert_eq!(tension(Vec2::new(1.0, 0.0), 0.0), 0.0);
         assert!(!exceeds_tension(Vec2::new(1e30, 0.0), 0.0));
+    }
+
+    #[test]
+    fn the_promotion_boundary_includes_the_threshold_exactly() {
+        // The one rule `World::resolve_thrown` and `exceeds_tension` both read.
+        // ADR-0011's bands are written "at or above `toughness`", so the
+        // threshold itself promotes: a boundary belonging to neither side would
+        // be a band of its own.
+        //
+        // Literals rather than a recomputation of the comparison: the
+        // neighbours of the threshold are named outright so the test cannot
+        // agree with the code by construction.
+        assert!(promotes(500.0), "the threshold itself must promote");
+        assert!(promotes(500.001), "above the threshold must promote");
+        assert!(
+            !promotes(499.999),
+            "just below the threshold must stay a target"
+        );
+        assert!(!promotes(0.0), "a slack Tongue must not promote");
+        // And the constant really is the number those literals assume, so this
+        // test cannot quietly stop testing the boundary if it is retuned.
+        assert_eq!(
+            THROW_TENSION, 500.0,
+            "retune the literals above with the threshold"
+        );
+        // The force-and-mass entry point reads the same boundary, measured
+        // independently: a force of 500 on a unit mass is a tension of 500.
+        assert!(exceeds_tension(Vec2::new(0.0, 500.0), 1.0));
+        assert!(!exceeds_tension(Vec2::new(0.0, 499.0), 1.0));
     }
 
     #[test]

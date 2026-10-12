@@ -807,10 +807,15 @@ impl World {
         // becomes Thrown, and the change is discrete, so it snaps rather than
         // blending; ADR-0009's interpolation already does that for any change
         // of kind.
+        //
+        // The boundary itself is `thrown::promotes` and is not restated here.
+        // It used to be, as an inline `>= THROW_TENSION`, which left the live
+        // comparison carrying none of the ADR-0011 reasoning for why the
+        // threshold exactly promotes.
         for i in 0..self.bodies.len() {
             let thrown = self
                 .half_step_of(i)
-                .is_some_and(|s| s.tension >= thrown::THROW_TENSION);
+                .is_some_and(|s| thrown::promotes(s.tension));
             if thrown && self.bodies[i].kind == BodyKind::Enemy {
                 self.bodies[i].kind = BodyKind::Thrown;
             }
@@ -4309,6 +4314,45 @@ mod tests {
             assert!(
                 end.x - hero_x > 2.0 * PLAYER_RADIUS + ENEMY_HALF_EXTENTS.x,
                 "the bodies met inside the window: hero at {hero_x}, Enemy at {end:?}"
+            );
+        }
+
+        #[test]
+        fn the_live_promotion_fires_at_the_threshold_exactly() {
+            // The boundary through the real tick rather than through the pure
+            // predicate beside it. `thrown::promotes` states the rule and
+            // `resolve_thrown` is the only caller that matters, so what can be
+            // wrong is whether the tick reads it or restates it: an inline
+            // `> THROW_TENSION` would leave every other promotion test passing
+            // and lose only this one.
+            //
+            // Exact in binary, which is what makes the boundary assertable at
+            // all: `REST_LENGTH` is 1, `DEFAULT_PULL_STRENGTH` is 40 and the
+            // threshold is 500, so a Stretch of 12.5 is a tension of exactly
+            // 500 on a unit mass with no rounding anywhere in the chain. The
+            // damping term is identically zero on the first tick out of a
+            // standstill, so this really is pure Hooke's law.
+            const AT: f32 = REST_LENGTH + thrown::THROW_TENSION / DEFAULT_PULL_STRENGTH;
+            let mut world = World::from_level(&yank(AT, 1.0));
+            let tension = tension_at_rest(&world, AT, 1.0);
+            assert_eq!(
+                tension,
+                thrown::THROW_TENSION,
+                "the fixture must sit on the boundary exactly, not near it"
+            );
+
+            let enemy = enemy_of(&world);
+            tap(&mut world, 1, Vec2::new(AT, 0.0));
+            world.step();
+            assert!(
+                slot_anchor(&world, 0).is_some(),
+                "the fixture must Attach to the Enemy, or no tension acts at all"
+            );
+            assert_eq!(
+                kind_of(&world, enemy),
+                Some(BodyKind::Thrown),
+                "a tension of exactly {} must promote",
+                thrown::THROW_TENSION
             );
         }
 
