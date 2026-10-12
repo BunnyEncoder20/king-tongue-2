@@ -438,6 +438,54 @@ mod tests {
     mod through_the_world_seam {
         use super::*;
 
+        #[test]
+        fn the_arc_prefers_an_enemy_over_the_terrain_behind_it_and_bends_nothing_otherwise() {
+            // The AC's two halves in one fixture, so that the second is the
+            // mutation of the first rather than a separate scene that might
+            // differ for some other reason. The only thing that changes between
+            // the two runs is the Enemy's spawn height.
+            let scene = |enemy_y: f32| {
+                let mut level = duel(1.0);
+                level.enemy_spawns[0].pos = Vec2::new(10.0, enemy_y);
+                let mut world = World::from_level(&level);
+                let enemy = enemy_of(&world);
+                // Along the x axis, straight at the wall. The aim is identical
+                // in both runs, which is the whole point.
+                tap(&mut world, 1, Vec2::new(10.0, 0.0));
+                world.step();
+                let anchor = world
+                    .snapshot()
+                    .tongues
+                    .iter()
+                    .find(|t| t.slot == 0)
+                    .map(|t| t.anchor);
+                (anchor, enemy)
+            };
+
+            // One unit off a ten unit aim is 5.7 degrees, inside the arc. The
+            // ray misses the Enemy's box outright, so preference is the only
+            // thing that can pick it.
+            let (inside, enemy) = scene(1.0);
+            assert_eq!(
+                inside,
+                Some(Anchor::Movable(enemy)),
+                "an Enemy inside the arc must be preferred over the wall behind it"
+            );
+
+            // Four units off the same aim is 21.8 degrees, outside it. The
+            // Anchor must then be the wall, at exactly the point a pure terrain
+            // cast finds: the arc expresses a preference and never moves the
+            // ray.
+            let (outside, _) = scene(4.0);
+            let pure = crate::tongue::cast(Vec2::ZERO, Vec2::X, &duel(1.0).static_terrain)
+                .expect("the ray meets the wall");
+            assert_eq!(
+                outside,
+                Some(Anchor::Fixed(pure)),
+                "an Enemy outside the arc changed where the hero Attached"
+            );
+        }
+
         /// The Tongue force at rest on a Tongue `length` long, which is pure
         /// Hooke's law: the damping term is `damping * radial_vel` and is
         /// identically zero at zero velocity. ADR-0003 records this as the
