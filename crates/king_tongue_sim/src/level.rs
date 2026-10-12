@@ -124,6 +124,28 @@ impl Level {
             if s.toughness <= 0.0 {
                 return Err(LevelError::Invalid("enemy toughness must be positive"));
             }
+            // A Kick must not be able to kill. Ticket #15 and ADR-0011 give a
+            // Kick fixed minimal damage because it is "a recoverable mistake
+            // rather than a death", but nothing downstream makes that true:
+            // `World` destroys on an emptied pool with one rule for every band,
+            // so an Enemy authored at or below [`crate::combat::KICK_DAMAGE`]
+            // dies to a single below-threshold bump. That kill would also be
+            // invisible to the Combo, which counts Slams and not Kicks.
+            //
+            // Caught here rather than by flooring the Kick's damage in
+            // `combat`, which would invent combat math: this is the last place
+            // that sees the authored figure, and rejecting the level says
+            // exactly which Enemy is wrong instead of silently changing what a
+            // Kick does to every Enemy.
+            //
+            // The comparison includes the threshold: spending exactly the pool
+            // leaves zero, and zero is destroyed.
+            if s.toughness <= crate::combat::KICK_DAMAGE {
+                return Err(LevelError::Invalid(
+                    "enemy toughness must exceed the Kick damage, or one \
+                     below-threshold Kick would destroy it",
+                ));
+            }
             if s.mass <= 0.0 {
                 return Err(LevelError::Invalid("enemy mass must be positive"));
             }
@@ -285,6 +307,48 @@ mod tests {
             mass: -1.0,
         }];
         assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_an_enemy_a_single_kick_could_destroy() {
+        // Ticket #15 calls a Kick "a recoverable mistake rather than a death",
+        // and ADR-0011 gives it fixed minimal damage for that reason. Nothing
+        // downstream enforces it: `World` has one destruction rule for
+        // everything (`retain(|b| b.toughness > 0.0)`), so an Enemy authored
+        // thin enough dies to one below-threshold bump, and because a Kick is
+        // not a Slam the Combo never records the kill. The guard has to be here,
+        // at load time, because this is the only place that sees the authored
+        // figure before play begins.
+        let kick_survivor = |toughness| {
+            let mut l = valid();
+            l.enemy_spawns = vec![EnemySpawn {
+                pos: Vec2::ZERO,
+                toughness,
+                mass: 1.0,
+            }];
+            l.validate().is_ok()
+        };
+
+        // The boundary, which is the case that matters: spending exactly the
+        // pool leaves zero, and zero is destroyed.
+        assert!(
+            !kick_survivor(crate::combat::KICK_DAMAGE),
+            "a pool a Kick empties exactly must be rejected"
+        );
+        assert!(
+            !kick_survivor(crate::combat::KICK_DAMAGE * 0.5),
+            "a pool one Kick overdraws must be rejected"
+        );
+        // And the other direction, so the guard is a boundary and not a ban on
+        // weak Enemies: anything a Kick leaves standing is authorable.
+        assert!(
+            kick_survivor(crate::combat::KICK_DAMAGE * 1.001),
+            "a pool that survives a Kick by a hair must be accepted"
+        );
+        assert!(
+            kick_survivor(100.0),
+            "an ordinary Enemy must still be authorable"
+        );
     }
 
     #[cfg(feature = "serde")]
