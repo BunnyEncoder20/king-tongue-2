@@ -151,6 +151,57 @@ pub fn releases_mid_swing(tick: u64, world: &mut World) {
     }
 }
 
+/// Holds two Tongues at once on two overlapping fingers, braces between them
+/// for a hundred ticks with a stray third finger hammering throughout, then
+/// Releases one slot and keeps Swinging on the other.
+///
+/// The dual-Tongue run the ticket #14 AC asks for, and it is not the same trace
+/// as [`fires_two_tongues`]: that script fires both and lifts both, so the two
+/// pulls only ever sum. This one also takes one away, which is where a dual
+/// trace can lose determinism and a single-Tongue one cannot. Two pulls summing
+/// is order-independent arithmetic; *which* slot a later Gesture lands on is not,
+/// because ADR-0006 decides it from ownership, so a frame read in a different
+/// order would Release the other Tongue and every tick after it would disagree.
+///
+/// The phases are the platform's own. Finger 1 stays down for the whole run,
+/// reporting `Stationary` every frame, which is the only way to hold two Tongues
+/// at all: under ADR-0006's slot rule a tap, a lift, and another tap return to
+/// slot 0 and Release it. Finger 2 lifts at tick 150 without Releasing anything,
+/// and the tap that follows finds slot 1 owned by nobody and occupied by a
+/// Tongue, so it Releases that one and leaves slot 0 Attached.
+///
+/// The stray finger between ticks 120 and 129 arrives on a **fresh id every
+/// frame**, which is the hostile version: an id the tracker has never seen
+/// cannot be refused for already owning a slot, so the only thing that can
+/// discard it is the slot cap itself.
+pub fn braces_between_two_anchors(tick: u64, world: &mut World) {
+    const UP_LEFT: Vec2 = Vec2::new(-2.0, 4.0);
+    const UP_RIGHT: Vec2 = Vec2::new(3.0, 2.0);
+    const DOWN: Vec2 = Vec2::new(0.0, -3.0);
+    const HOLD_1: (u64, TouchPhase, Vec2) = (1, TouchPhase::Stationary, UP_LEFT);
+    const HOLD_2: (u64, TouchPhase, Vec2) = (2, TouchPhase::Stationary, UP_RIGHT);
+    match tick {
+        20 => aim_all(world, &[(1, TouchPhase::Started, UP_LEFT)]),
+        // The second finger lands while the first is still down, which is what
+        // makes this two Tongues rather than a fire and a Release.
+        40 => aim_all(world, &[HOLD_1, (2, TouchPhase::Started, UP_RIGHT)]),
+        // The end of the second Gesture, not a Release: both Tongues stay.
+        150 => aim_all(world, &[HOLD_1, (2, TouchPhase::Ended, UP_RIGHT)]),
+        // Slot 0 is still owned by finger 1, so this lands on slot 1 and
+        // Releases it. Its aim is irrelevant to a Release and deliberately
+        // points somewhere neither Tongue is Attached.
+        151 => aim_all(world, &[HOLD_1, (4, TouchPhase::Started, DOWN)]),
+        121..=130 => aim_all(
+            world,
+            &[HOLD_1, HOLD_2, (100 + tick, TouchPhase::Started, DOWN)],
+        ),
+        21..=39 => aim_all(world, &[HOLD_1]),
+        41..=149 => aim_all(world, &[HOLD_1, HOLD_2]),
+        152.. => aim_all(world, &[HOLD_1, (4, TouchPhase::Stationary, DOWN)]),
+        _ => {}
+    }
+}
+
 /// Taps three times in the same frame, every frame, forever.
 ///
 /// Hostile input as a script. Three concurrent ids must leave two Tongues, and
@@ -547,6 +598,91 @@ mod tests {
         assert_eq!(
             trace[142].tongues[0].slot, 0,
             "a re-fire must come back to slot 0"
+        );
+    }
+
+    #[test]
+    fn bracing_between_two_anchors_produces_identical_snapshot_sequences() {
+        // Ticket #14's determinism clause. Two pulls summing is arithmetic that
+        // cannot care about order, but which slot the Gesture at tick 151
+        // Releases is decided from ownership, and a frame read in a different
+        // order would take the other Tongue away. From there the two runs are
+        // Swinging on different Anchors and every later tick disagrees.
+        assert_deterministic(&enclosed_scene(), 300, braces_between_two_anchors);
+    }
+
+    #[test]
+    fn the_bracing_script_really_holds_two_tongues_and_then_one() {
+        // Guards the test above from passing vacuously, which for a dual-Tongue
+        // script is a live risk rather than a formality: ADR-0006's slot rule
+        // means a script written as tap, lift, tap ends with *no* Tongues, and
+        // it would agree with itself perfectly while asserting nothing about
+        // holding two.
+        let trace = record(&enclosed_scene(), 300, braces_between_two_anchors);
+        let anchors = |tick: usize| -> Vec<_> {
+            let mut a: Vec<_> = trace[tick]
+                .tongues
+                .iter()
+                .map(|t| (t.slot, t.anchor))
+                .collect();
+            a.sort_by_key(|(slot, _)| *slot);
+            a
+        };
+
+        assert_eq!(
+            trace[21].tongues.len(),
+            1,
+            "the first Gesture must have Attached: {:?}",
+            trace[21].tongues
+        );
+        assert_eq!(
+            trace[41].tongues.len(),
+            2,
+            "two overlapping fingers must hold two Tongues: {:?}",
+            trace[41].tongues
+        );
+        let braced = anchors(41);
+        assert_ne!(
+            braced[0].1, braced[1].1,
+            "the two Tongues must be on different Anchors, or this is not a brace"
+        );
+
+        // The stray finger ran for ten frames in the middle of that, and
+        // changed nothing at all: same count, same slots, same Anchors.
+        assert_eq!(
+            anchors(131),
+            anchors(121),
+            "a third finger disturbed a slot while two Tongues were held"
+        );
+
+        // Then one slot was Released and the other kept Swinging.
+        assert_eq!(
+            trace[152].tongues.len(),
+            1,
+            "the Gesture at tick 151 must Release exactly one Tongue: {:?}",
+            trace[152].tongues
+        );
+        assert_eq!(
+            trace[152].tongues[0].slot, 0,
+            "slot 1 was the one Released, so slot 0 must be what is left"
+        );
+        assert_eq!(
+            trace[152].tongues[0].anchor, braced[0].1,
+            "the surviving Tongue must be on the Anchor it has had all along"
+        );
+        let last = trace.last().expect("a trace is never empty");
+        assert_eq!(
+            last.tongues.len(),
+            1,
+            "the run must end still Attached by one slot: {:?}",
+            last.tongues
+        );
+        assert!(
+            last.tongues
+                .iter()
+                .all(|t| t.to.is_finite() && t.from.is_finite()),
+            "a Tongue endpoint went non-finite: {:?}",
+            last.tongues
         );
     }
 
