@@ -31,7 +31,11 @@ This section was written as `|m * v · n|` with `v` the hero's velocity, and tic
 
 `combat::tests::an_enemy_already_moving_away_reads_a_lower_band_than_the_absolute_gate_would` is that table, so the rows are asserted rather than asserted-in-prose. A hit this ADR's band table calls Destroy can therefore resolve as a Slam, as a Kick, or as a miss, and the fleeing speeds that reach the lower rows are reachable: the two-impacts-per-tick route in `World::resolve_impacts` drains the hero while an Enemy a previous tick's Slam or Kick already set moving keeps its speed.
 
-**Whether that band structure is what the game wants is a separate question and is not settled here.** This amendment records what the gate computes and why that form supersedes the absolute one. It does not redesign the bands; if the drop from Destroy to Kick is unwanted, the fix is a decision about the bands and not about the gate.
+**The band structure is wanted, and the drop is the mechanic: intercept, do not chase.** This was left open when the amendment above was written and is now settled (#22). An Enemy you have already sent flying is harder to finish, so putting it down means coming at it on a fresh angle rather than tailgating it, and a hero who merely gains on its victim has not earned a Destroy.
+
+Two facts make that a skill expression rather than a tax. **The fleeing speeds are never a first impact**: only a previous Slam, a Kick's elastic repel, or a Tongue can give an Enemy 8.5 units/s, so every row below the first is a chain the player built. And the gate keeps the hero's **own** mass rather than a reduced mass, so the number stays a statement about the hero's commitment and not about the victim's weight.
+
+Two alternatives were rejected. Reverting to the absolute form makes a fleeing Enemy take exactly what a stationary one takes, which erases positioning from the chain and lets a hero "destroy" something it is barely catching. True relative momentum with a reduced mass `m1 m2 / (m1 + m2)` is the most physical and the worst for feel, because reduced mass shrinks with the victim: it would make **light** Enemies the hard ones to destroy.
 
 ## Three bands against one Toughness value
 
@@ -60,6 +64,22 @@ Recorded while fixing Phase 5's review findings.
 The player loses momentum in proportion to the `toughness` actually consumed, clamped so one impact can never drain more than 50 percent of the incoming momentum vector. Above a high momentum ceiling the drain is zero: direction and speed are preserved and the hero passes straight through Enemies.
 
 A flat percentage was rejected. It makes destroying a trivial Enemy cost exactly as much as destroying a heavy one, which flattens chaining from a skill into a tuning constant.
+
+### The drain is a player-cost rule, not a momentum exchange
+
+**It answers what the player pays for a kill, denominated in the player's own speed, and it is not a conservation law.** Settled in #22 after the relative sweep made the extreme case reachable.
+
+The case that forces the question: a fast Enemy striking a **stationary** hero destroys itself against the hero's `toughness` while the hero's velocity stays exactly zero and the Enemy keeps all of its speed. That exchange conserves nothing. It is correct under this rule rather than in spite of it, because payment is in a currency a parked hero does not hold: you cannot slow something that is not moving, you can only push it, and pushing the hero is knockback, which this game has deliberately not built while the hero's fail state is deferred.
+
+This is the same rule as the `PASS_THROUGH_MOMENTUM` ceiling, at the opposite extreme. Above the ceiling the hero pays nothing because it is unstoppable; at zero speed it pays nothing because it is an anvil. Both are the hero's position in a momentum economy rather than a body in a solver.
+
+An impulse along the contact normal would conserve momentum everywhere and was rejected, because it costs a decision this section already made: the drain scales the incoming vector precisely so it "only ever shortens the vector and never turns it", and a normal impulse deflects a hero slamming at an angle. Slowing the Enemy alone was rejected too: momentum would vanish rather than transfer, which is a third non-conservation rule rather than a repair of the first. The reachable stakes are also narrower than they look, since a non-Thrown Enemy only reaches those speeds on a Tongue that is still pulling it, so any slowing applied at impact is undone by the spring on the next tick; a Thrown Enemy goes through `thrown::plough` instead.
+
+### The gate and the drain are deliberately in different frames
+
+The gate is relative closing; the drain's ceiling and its proportional denominator are both the hero's **own** momentum, `|m * v|`. That split is intended (#22), and each frame answers a different question: **the gate asks how hard the two bodies met, the drain asks what the player pays.**
+
+Keying the ceiling on relative closing instead would make a hero at 400 units/s payable again merely because its victim happened to be fleeing, which is the opposite of what "unstoppable" means. The fraction `toughness_spent / incoming` mixes units on purpose: toughness over the hero's momentum is a cost ratio, "what share of my speed did this cost me", and not a physical identity.
 
 ## Combo
 
@@ -93,7 +113,13 @@ A Tongue attached to an Enemy computes a tension force from the hero's `pull_str
 
 Above the threshold the Enemy becomes Thrown: a weaponized projectile yanked along the resultant of the hero's arc. Releasing the Tongue slings it into a ballistic arc on its residual velocity. If the player does not Release, it barrels back toward the hero.
 
-State is the arbiter of what happens when an Enemy strikes the hero. In the tracking state it is a Kick. Thrown, it destroys the hero outright, whether or not the Tongue is still attached.
+State is the arbiter of what happens when an Enemy strikes the hero. Thrown, it destroys the hero outright, whether or not the Tongue is still attached.
+
+**The clause this section used to carry, that a tracking Enemy striking the hero is a Kick, is narrowed to the Enemy autonomy it was written for, and that does not exist yet (#22).** It presumed an Enemy with volition that chose to close on the hero; nothing in the map gives an Enemy volition, so as written it governed a state nothing can be in. It returns as a question for whichever effort builds autonomy, not as a rule in force now.
+
+What is reachable today is a **non-Thrown Enemy driven into the hero by a Tongue**, and that resolves symmetrically through the three bands above, against the Enemy's own `toughness`, exactly as a hero striking an Enemy does. The gate does not ask which body supplied the speed, and it should not: relative closing is the whole point of the frame above.
+
+That interaction is load-bearing rather than incidental, which is the second reason the old clause could not simply be honoured. Tension is force over mass and the per Tongue ceiling is `DEFAULT_FORCE_CEILING`, so **an Enemy of mass 4.8 or more can never reach `THROW_TENSION` even on two Tongues** and can never be promoted to Thrown at all. Reeling it into the hero is its only tension-based kill: the wrecking ball arriving without the Thrown state. Reading the old clause literally would have deleted that to satisfy a sentence about a state machine nobody has designed.
 
 While Thrown, its collision rules invert completely:
 
