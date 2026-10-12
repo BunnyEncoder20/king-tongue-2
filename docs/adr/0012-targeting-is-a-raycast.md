@@ -28,6 +28,8 @@ And an Enemy the ray **literally strikes** is a candidate whatever the arc says.
 
 Where two Enemies both qualify, the nearer along the ray wins. Discovered while implementing ticket #17.
 
+**A Thrown Enemy is not in the target set at all, so the arc never sees one.** ADR-0015 decides that, and the consequence here is worth stating where a reader looks for what a tap can Attach to: a ray that meets a weapon in flight passes straight through it to the terrain behind, at exactly the point a pure terrain cast would have found. The arc is not merely declining to prefer it; the body is absent from the candidates, which is what makes that point bit-identical. Noted while implementing ticket #18.
+
 ## Movable Anchors attach at the centre of mass
 
 A Tongue attaching to an Enemy or any other Movable Anchor attaches at its exact centre of mass, never at the surface point the ray struck and never at an offset attachment node. This keeps the spring force collinear with the line between the two bodies, which is what makes the mass-ratio pull in ADR-0003 and the tension calculation in ADR-0011 well defined. A surface attachment point would introduce a torque the simulation has no way to represent, since bodies here have no angular dynamics.

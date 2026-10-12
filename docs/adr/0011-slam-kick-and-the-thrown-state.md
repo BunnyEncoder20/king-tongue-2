@@ -76,9 +76,49 @@ Deliberately high risk and high reward: any terrain contact ends it, so using an
 
 The freed Anchor slot in that last row is now the general rule rather than a special case of mutual destruction: ADR-0014 frees the slot whenever a Movable Anchor leaves the simulation, by either route, and cites this matrix as the precedent it generalises.
 
+**The tension threshold is denominated as an acceleration and not as a force, which is where the mass differential lives.** The sentence above derives the tension from "the hero's `pull_strength`, the relative velocities, and the mass differential", and the first two are already the Tongue's own force law: ADR-0003's spring takes `pull_strength` and damps against the relative radial velocity. The third is dividing by the Anchor's own mass. Comparing a bare force against the threshold would make a heavy Enemy exactly as easy to Throw as a light one, which is the one thing the mass differential is in that sentence to prevent, so `THROW_TENSION` is in world units per second squared and the comparison is against the body's own acceleration from its Tongues.
+
+`THROW_TENSION` is 500, which is a tuning starting point like `KICK_THRESHOLD` and not a measured figure. What fixes its order of magnitude is that **both bands have to stay reachable**. At the baseline hero's `pull_strength` of 40 and `REST_LENGTH` of 1, a mass 1 Enemy reaches 500 at a Stretch of 12.5, so an Attach inside 13.5 units merely tracks it. That keeps the tracking band the common case, which it has to be, because this matrix gives that band rules of its own and a threshold an ordinary Attach cleared would delete the band and its environmental immunity with it. What does reach the threshold is loading the Stretch, which ADR-0003 already names as the deliberate manoeuvre, grabbing something light, or holding one Enemy with both slots, since two pulls sum. It is also comfortably under the per-Tongue `DEFAULT_FORCE_CEILING` of 1200, so the state is reachable without the clamp being involved at all; that relation is a `const` assertion rather than a test, because nothing a simulation could run would make it more true.
+
+**The promotion is read from a force and applied after integration, which the integrator forces.** ADR-0007 evaluates acceleration twice per Sim Tick, so the tension reading has to be a pure function of position and velocity and the state change it decides has to happen once, after the position and velocity steps, exactly like an impulse. The reading is therefore taken during the tick's first evaluation, parked in the per-body half-step, and spent after the integration loop.
+
+**Weight class is mass, with a band, and heavier folds into the equal row.** The matrix says "a lesser Enemy" and "an equal weight class": a weight class is a weight, and `Toughness` is already spoken for by the three bands above. The band is a tenth, because mass arrives from level data as a float and two Enemies authored at the same weight must not fall into different rows on a last-bit difference when the row decides whether the player keeps a weapon or loses one. A target *heavier* than the projectile is a fourth case the matrix does not have; it folds into mutual destruction, because the only alternative readings are that it destroys the projectile alone or that nothing happens, and both make the risk of wielding a weapon go *down* as the target gets heavier, which inverts the whole band structure above.
+
+**The lesser row's "minor proportional velocity damping" is proportional to the target's weight relative to the projectile's.** Proportionality needs something to be proportional to, and the target's weight is the only candidate in the collision that is not arbitrary: ploughing something a tenth of your weight should not cost what ploughing something at the edge of your own weight class does. The coefficient is a fifth, and because a target at or above the band is mutual destruction and never reaches this row, a surviving projectile keeps at least four fifths of its speed. The velocity is **scaled** rather than reduced along the contact normal, for the same reason `momentum_drain` scales the hero's: the drag then only ever shortens the vector and never turns it, and a weapon that changed direction on every body it passed through could not be aimed.
+
+**Terrain is any contact, read off the integrator's own sweep.** "Any terrain contact ends it" is taken literally: a Thrown Enemy resting on a floor is destroyed by it, not only one that arrives at speed. The test is the contact count the swept motion already produced rather than a fresh geometry test, which makes "struck terrain" mean exactly what the integrator means by it and immune to tunnelling at any speed, since the sweep is continuous.
+
+**The matrix is resolved before the promotion, and that ordering is a rule rather than an arrangement.** A body below the threshold when a tick's motion began keeps its environmental immunity for the whole of that motion: it slides along terrain, and it is promoted at the end of the tick, so the inverted matrix governs its next tick. Promoting first would destroy an Enemy against the very surface it was immune to while being dragged along it, which is the one outcome the immunity clause exists to forbid. The visible consequence is one tick of Thrown before the terrain row can reach it, which is correct and also means the kind change is published for at least one `Snapshot` before the body leaves.
+
+Within the matrix, **terrain is resolved before the Enemy rows and a projectile it destroys ploughs nothing**. Terrain is the row that ends the state, and a weapon that met a wall and an Enemy on the same tick should not collect the reward on its way out.
+
+**The state is terminal: nothing demotes a Thrown Enemy back to a target.** There is no cooling off and no route back, which is what makes a Released weapon still destroy whatever it lands among rather than becoming harmless the moment the Tongue is gone. A Thrown Enemy ends by being destroyed or by leaving the Kill Bound.
+
+Recorded while implementing ticket #18.
+
+### Hero death is not implemented, and that is deliberate
+
+"Thrown, it destroys the hero outright" is **not built**. The hero's one-shot fail state, any lose condition, run structure and restart are all deferred in the map's fog at the bottom of this ADR, so there is nothing for the branch to trigger: no run to end, no screen to show, no restart to offer. The hero's `Toughness` pool is infinite, which says the same thing in the same terms everything else uses. Confirmed with the project owner on ticket #18.
+
+What happens instead is nothing: a Thrown Enemy and the hero pass through each other. **Not a Kick**, which was the tempting alternative and is the wrong one. This ADR makes state the arbiter of what an Enemy striking the hero does and assigns the Kick to the *tracking* state, so implementing a Kick for the Thrown state would contradict the ADR rather than defer to it, and it would do so invisibly, by making a case that is meant to be fatal feel survivable.
+
+The seam is the `BodyKind::Enemy` filter in `resolve_impacts` and the matching one in `resolve_thrown`. A Thrown body whose swept pass meets the hero is the condition, and both filters carry a comment saying so, so whoever implements the fail state has one place to look and nothing to undo.
+
+### The struck route into Thrown is not implemented, and it cannot be as written
+
+The band table above says that an impact above the Kick threshold and below `toughness` spends momentum against the pool **and the Enemy enters Thrown**, and the GLOSSARY defines Thrown as reached by being "pulled hard enough by a Tongue **or struck hard enough** to be weaponized". Only the pulled route is built. The struck route is left out because, taken together with the rest of this ADR, it is self-defeating rather than merely unimplemented, and resolving that needs a decision rather than an implementation choice.
+
+Two clauses of this ADR contradict it directly. The momentum drain section exists so "the pool lets a weak hero chip a heavy one over several passes", and the terrain row destroys a Thrown Enemy on any contact. An Enemy standing on a floor that entered Thrown on its first Slam would be destroyed by the floor it was standing on, on the next tick, whatever its `Toughness` was. One Slam would kill every grounded Enemy in the game and the `Toughness` pool, this ADR's central combat idea, would never be spent at all. ADR-0015 sharpens the same point from the other side: a Thrown Enemy is not a target, so a chipped Enemy would also be immune to the second and third passes the chipping rule is about.
+
+The intent behind the clause is clearly real and worth keeping: Slamming an airborne Enemy into another one is exactly the chaining this combat model is built for. But every way of having both needs a decision nobody has made. Possibilities, none of them chosen here: only a Slam that leaves the Enemy airborne promotes it; a struck Enemy enters Thrown only once its pool is nearly spent; or the terrain row distinguishes a weapon the player is still holding from one that is merely tumbling. Each is a different game, and picking one from inside a ticket would be inventing the answer rather than recording it.
+
+Noted while implementing ticket #18.
+
 ## Despawn is world-space
 
 A destroyed or Thrown Enemy leaving the level's Kill Bound is removed. The bound is declared in level data as a world-space rectangle and is never a screen-space test, because screen dimensions vary across the device floor and a screen-space test would make outcomes device-dependent, voiding the determinism ADR-0002 exists to provide.
+
+Two further questions this section left open, whether a Thrown Enemy can be grappled and whether its kills advance the Combo, are both answered no by ADR-0015.
 
 ## Out of scope
 
