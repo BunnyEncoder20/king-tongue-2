@@ -5,10 +5,20 @@
 //! cargo-ndk plus a hand-owned Gradle shell. ADR-0009 fixes the frame contract.
 
 // The mechanism that stops a new entity silently failing to render. Adding a
-// `BodyKind` variant breaks the match in `draw_body`, and this lint forbids
+// `BodyKind` variant breaks the match in `draw_body`, and these lints forbid
 // papering over that break with a catch-all arm. CI runs clippy with
-// `-D warnings`, so it is a build failure rather than advice.
+// `-D warnings`, so they are a build failure rather than advice.
+//
+// Both lints, and the second is not redundant: ticket #20 checked this guard by
+// adding a variant and trying to silence the break, and found that
+// `wildcard_enum_match_arm` does not fire when the wildcard covers exactly one
+// missing variant. Clippy reports that case under
+// `match_wildcard_for_single_variants` instead, which is a `pedantic` lint and
+// so off by default. One missing variant is the case that actually happens: a
+// ticket adds one `BodyKind` at a time. Without the second lint the first was
+// a guard against adding two entities and nothing else.
 #![warn(clippy::wildcard_enum_match_arm)]
+#![warn(clippy::match_wildcard_for_single_variants)]
 
 use king_tongue_sim as sim;
 use sim::{Accumulator, BodyKind, Snapshot};

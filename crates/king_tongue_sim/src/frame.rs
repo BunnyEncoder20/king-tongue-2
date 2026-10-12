@@ -92,10 +92,13 @@ impl Accumulator {
 
 /// What kind of thing a body is, which decides how the Shell draws it.
 ///
-/// Adding a variant here is intended to break the Shell's match. The Shell sets
-/// `clippy::wildcard_enum_match_arm` to deny, so a catch-all arm cannot be used
-/// to silence that break, which is what stops a new entity silently failing to
-/// render.
+/// Adding a variant here is intended to break the Shell's match, with
+/// `error[E0004]`. The Shell also warns on `clippy::wildcard_enum_match_arm`
+/// **and** on `clippy::match_wildcard_for_single_variants`, and CI runs clippy
+/// with `-D warnings`, so a catch-all arm cannot be used to silence that break
+/// either. Both lints are needed: the first does not fire when the wildcard
+/// covers exactly one missing variant, which is the case a ticket adding one
+/// entity produces. See the comment at the top of the Shell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyKind {
     Hero,
