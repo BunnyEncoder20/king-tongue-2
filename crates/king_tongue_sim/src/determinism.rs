@@ -369,6 +369,189 @@ pub fn throws_an_enemy_into_another(tick: u64, world: &mut World) {
     }
 }
 
+/// Everything at once: a Movable Anchor that Throws, a Fixed Anchor braced
+/// against it, a weapon that ploughs an Enemy and dies on terrain, Slams that
+/// build and lose a Combo, a stray third finger, and a Release.
+///
+/// Every script above it exercises one mechanic's slice. This one is the
+/// cross-cutting run ticket #20 exists for, and the difference is not merely
+/// that it is longer: each mechanic above was deterministic *alone*, and what
+/// nothing had asserted is that they are deterministic while interacting. The
+/// three-body phase, the Thrown promotion, the plough, an impact, and ADR-0014's
+/// slot sweep all land inside the same few ticks here, in an order the script
+/// does not choose, which is the arrangement a per-mechanic trace cannot
+/// produce.
+///
+/// One thing in it is placed and one only: the strike at tick 55, which aims
+/// the weapon at a target the way `throws_an_enemy_into_another` does and for
+/// the same reason. ADR-0011's mutual row cannot be reached emergently from a
+/// single tap, and the geometry says why rather than it being a matter of
+/// patience. The pull is always *toward* the hero, so an Enemy on the weapon's
+/// path when the tap went out would have been the nearer candidate and
+/// ADR-0012's arc would have Attached to it instead; and the pair's separation
+/// oscillates about a common centre of mass, so the weapon never travels
+/// further from the hero than the Enemy started, which leaves nowhere for an
+/// unstruck victim to stand. Everything else here, both Throws and every death,
+/// is earned by a tap.
+///
+/// That one placement is why [`every_mechanic`] is registered with an injection
+/// tick. [`World::place`] assigns a velocity from outside the simulation, which
+/// is an injection of kinetic energy, and the energy budget re-baselines on
+/// exactly the ticks a script does it rather than pretending it did not happen.
+pub fn every_mechanic(tick: u64, world: &mut World) {
+    // Up and to the right, at the Enemy near the ceiling. Twenty-two units of
+    // reach is a Stretch of 21 at `REST_LENGTH` 1, so the Attach puts 862 of
+    // tension on a sketched Enemy's mass of 1 against ADR-0011's threshold of
+    // 500: it is Thrown by the pull itself rather than by anything scripted.
+    const AT_HIGH_ENEMY: Vec2 = Vec2::new(20.0, 10.0);
+    // Directions and not points. A closed room is terrain in every direction
+    // from anywhere inside it, so an aim chosen this way always has an answer,
+    // and an aim that is a direction cannot go stale as the hero moves: that
+    // staleness is the trap ticket #17's script fell into, where a scene valid
+    // when it was written was missed by the tick the tap actually fired.
+    const UP: Vec2 = Vec2::new(0.0, 20.0);
+    const DOWN: Vec2 = Vec2::new(0.0, -20.0);
+    // The three the repeating phase cycles through. Diagonal, which is the
+    // whole reason they are not `UP` and `DOWN`: a pull straight along the
+    // Tongue is radial, so the hero rises and falls and never goes anywhere,
+    // and a run of those lands no Slam at all. Off-axis, the hero's own
+    // momentum carries it across the pull and the Release throws it along a
+    // ballistic arc into the floor row, which is where the Combo comes from.
+    const SWINGS: [Vec2; 3] = [
+        Vec2::new(20.0, 12.0),
+        Vec2::new(-20.0, 12.0),
+        Vec2::new(4.0, 12.0),
+    ];
+    /// The tick the weapon is aimed at a target. See the doc comment above.
+    const STRIKE: u64 = 55;
+    const HOLD_1: (u64, TouchPhase, Vec2) = (1, TouchPhase::Stationary, AT_HIGH_ENEMY);
+    const HOLD_2: (u64, TouchPhase, Vec2) = (2, TouchPhase::Stationary, UP);
+
+    if tick == STRIKE {
+        // Both bodies read out of the `Snapshot` by identity rather than
+        // written as coordinates, so the script cannot drift out of step with
+        // the scene: the weapon is whichever body the simulation says is
+        // Thrown, and the victim is the Enemy nearest it.
+        let hero = world.hero_id();
+        let bodies: Vec<(crate::EntityId, crate::BodyKind, Vec2)> = world
+            .snapshot()
+            .bodies
+            .iter()
+            .filter(|b| b.id != hero)
+            .map(|b| (b.id, b.kind, b.pos))
+            .collect();
+        let weapon = bodies
+            .iter()
+            .find(|(_, kind, _)| *kind == crate::BodyKind::Thrown)
+            .copied();
+        if let Some((id, _, at)) = weapon {
+            let victim = bodies
+                .iter()
+                .filter(|(_, kind, _)| *kind == crate::BodyKind::Enemy)
+                .min_by(|a, b| {
+                    (a.2 - at)
+                        .length_squared()
+                        .total_cmp(&(b.2 - at).length_squared())
+                })
+                .copied();
+            if let Some((_, _, target)) = victim {
+                // Three units short of the victim and fast enough to cross that
+                // in one tick, so the strike is a swept contact and not an
+                // overlap that was placed there.
+                let approach = (target - at).normalize_or_zero();
+                world.place(id, target - approach * 3.0, approach * 180.0);
+            }
+        }
+    }
+    // The repeating phase, and the reason this script is worth running for a
+    // full minute rather than three hundred ticks: without it the hero settles
+    // onto the floor around tick 350 and every tick after that is a hero at
+    // rest, which asserts nothing and is exactly the shape of a long run that
+    // looks thorough and is not.
+    const CYCLE_START: u64 = 200;
+    const CYCLE: u64 = 300;
+
+    if tick >= CYCLE_START {
+        let n = (tick - CYCLE_START) / CYCLE;
+        // Two fingers per cycle, because one Gesture can only do one thing:
+        // ADR-0006 makes a tap on an occupied slot the Release, so firing and
+        // Releasing are two taps and the finger between them has to lift.
+        let fires = 10 + 2 * n;
+        let releases = 11 + 2 * n;
+        // Whichever finger held slot 1 before this cycle: finger 3 the first
+        // time, and the previous cycle's Releasing finger after that.
+        let previous = if n == 0 { 3 } else { 9 + 2 * n };
+        // Three aims against two fingers, and three deliberately rather than
+        // two: with two the aim locked in step with the fire and every single
+        // Attach in the second half of the run came out the same way, which is
+        // a long run that looks varied and is not.
+        let aim = SWINGS[(n % 3) as usize];
+        match (tick - CYCLE_START) % CYCLE {
+            // The previous Gesture ends. ADR-0006 makes attachment outlast the
+            // finger, so this Releases nothing: it hands the slot over.
+            0 => aim_all(world, &[HOLD_1, (previous, TouchPhase::Ended, aim)]),
+            // Slot 0 is still owned by finger 1, so this lands on slot 1 and
+            // does whatever ADR-0006 says about what is in it: a fire into an
+            // empty slot, a Release of an Attached one.
+            1 => aim_all(world, &[HOLD_1, (fires, TouchPhase::Started, aim)]),
+            2..=29 => aim_all(world, &[HOLD_1, (fires, TouchPhase::Stationary, aim)]),
+            // Thirty ticks after the fire, and the gap is the point of the
+            // whole arrangement. A tap reels the hero in along the Tongue, and
+            // half a second later it is travelling fast and has not yet
+            // arrived; a Release there throws it along a ballistic arc with
+            // real horizontal speed, which is what carries it through the floor
+            // row. A Release two hundred ticks later cannot, because by then
+            // the hero is hanging at the Anchor at a standstill, and a run of
+            // those lands no Slam at all.
+            30 => aim_all(world, &[HOLD_1, (fires, TouchPhase::Ended, aim)]),
+            31 => aim_all(world, &[HOLD_1, (releases, TouchPhase::Started, aim)]),
+            // And then nothing until the next cycle, which is the rest of the
+            // loop: fly, land, skid, tap again.
+            _ => aim_all(world, &[HOLD_1, (releases, TouchPhase::Stationary, aim)]),
+        }
+        return;
+    }
+
+    match tick {
+        10 => aim_all(world, &[(1, TouchPhase::Started, AT_HIGH_ENEMY)]),
+        // The second finger lands while the first is still down, which ADR-0006
+        // makes the only way to hold two Tongues. One Movable Anchor and one
+        // Fixed is the three-body system ADR-0003 describes, and by this tick
+        // the pull has carried the hero far enough off the floor that the
+        // second Tongue is genuinely Stretched rather than slack.
+        //
+        // Straight up, where the only body is the Enemy this run has already
+        // Thrown. ADR-0015 takes a Thrown Enemy out of the target set, so this
+        // tap passes it and Attaches to the ceiling behind it, which is the
+        // second Tongue being Fixed rather than a second Movable Anchor.
+        40 => aim_all(world, &[HOLD_1, (2, TouchPhase::Started, UP)]),
+        // A stray finger on a **fresh id every frame**, so it cannot be refused
+        // for already owning a slot and only ADR-0006's cap can discard it.
+        // Deliberately during the three-body phase, which is when a slot
+        // disturbed by a third finger would do the most damage.
+        60..=69 => aim_all(
+            world,
+            &[HOLD_1, HOLD_2, (1000 + tick, TouchPhase::Started, DOWN)],
+        ),
+        // Finger 2's Gesture ends without Releasing anything, and the tap that
+        // follows finds slot 1 unowned and occupied, so it Releases the
+        // ceiling. That has to happen before `CYCLE_START`, and not for
+        // tidiness: the repeating phase fires at the start of a cycle and
+        // Releases thirty ticks in, so arriving there with slot 1 still
+        // Attached inverts the two and the hero spends every cycle reeled in
+        // and thirty ticks airborne instead of the other way round. It was
+        // written that way first, and the hero sat against the ceiling for
+        // three thousand ticks.
+        150 => aim_all(world, &[HOLD_1, (2, TouchPhase::Ended, UP)]),
+        151 => aim_all(world, &[HOLD_1, (3, TouchPhase::Started, UP)]),
+        11..=39 => aim_all(world, &[HOLD_1]),
+        41..=59 | 70..=149 => aim_all(world, &[HOLD_1, HOLD_2]),
+        // Up to `CYCLE_START`, where the repeating phase above takes over.
+        152..=199 => aim_all(world, &[HOLD_1, (3, TouchPhase::Stationary, UP)]),
+        _ => {}
+    }
+}
+
 /// Taps three times in the same frame, every frame, forever.
 ///
 /// Hostile input as a script. Three concurrent ids must leave two Tongues, and
@@ -1282,6 +1465,203 @@ mod tests {
             kinds.contains(&crate::BodyKind::Thrown) && kinds.contains(&crate::BodyKind::Enemy),
             "the strike must be a weapon against a target, got {kinds:?}"
         );
+    }
+
+    /// A closed room with a floor, one Enemy near the ceiling twenty-two units
+    /// up and to the right of the hero, and a row of Enemies resting on the
+    /// floor beside it.
+    ///
+    /// Flush to the left margin, because `from_ascii` counts leading
+    /// indentation as columns and every distance here is load-bearing. The high
+    /// Enemy is what `every_mechanic` taps: at `REST_LENGTH` 1 that reach is a
+    /// Stretch of 21.6, which puts 862 of tension on a sketched Enemy's mass of
+    /// 1 against ADR-0011's threshold of 500, so the Attach Throws it.
+    ///
+    /// The floor row is on the floor rather than in the air, which is not
+    /// decoration. A sketched body spawned in mid-air falls, so an airborne
+    /// scatter is somewhere different on every tick and nothing can be said
+    /// about what a later tap will find; resting on the floor they stay where
+    /// the sketch drew them, and the Enemy three units to the hero's right is
+    /// what the Thrown weapon ploughs into on its way down.
+    ///
+    /// Closed on all four sides, so a tap in any direction meets terrain and
+    /// the ray cast always has an answer. The Kill Bound is therefore
+    /// unreachable here, which is deliberate rather than an oversight: a
+    /// sketch's bound is its own extent, so a closed room cannot produce one,
+    /// and a trace where both of ADR-0011's removal routes were live could not
+    /// say which of them had diverged. `kill_bound_run` is the trace that
+    /// covers despawn.
+    ///
+    /// The floor row is clear of the tapped vector by construction. Every one
+    /// of them is more than 70 degrees off it against ADR-0012's 10 degree arc,
+    /// and none is struck by the ray, so the tap Attaches to the high Enemy.
+    fn everything_scene() -> Level {
+        Level::from_ascii(
+            "\
+##################################
+#................................#
+#.....................e..........#
+#................................#
+#................................#
+#................................#
+#................................#
+#................................#
+#................................#
+#................................#
+#................................#
+#................................#
+#.@...e..e..e..e..e..e..e..e..e..#
+##################################
+",
+        )
+    }
+
+    /// A full minute of Sim Ticks, which is the length the energy budget and
+    /// the stability sweep are stated over as well.
+    const MINUTE: u32 = 3600;
+
+    #[test]
+    fn a_run_with_every_mechanic_at_once_produces_identical_snapshot_sequences() {
+        // The cross-cutting claim, and the one thing ticket #20 adds that no
+        // earlier ticket could: every script above this one was deterministic
+        // *alone*, and nothing had asserted that they are deterministic while
+        // interacting. Here the three-body phase, the Thrown promotion,
+        // ADR-0011's mutual row, an impact, the Combo and ADR-0014's slot sweep
+        // all land inside the same few ticks, in an order no script chose.
+        assert_deterministic(&everything_scene(), MINUTE, every_mechanic);
+    }
+
+    #[test]
+    fn the_every_mechanic_script_really_exercises_every_mechanic() {
+        // Without this the test above is the most vacuous kind of green: a
+        // script whose opening tap missed would be perfectly deterministic for
+        // three thousand six hundred ticks and would assert nothing about
+        // anything. Every mechanic the run claims is checked here separately,
+        // because any one of them going quiet leaves the rest looking fine.
+        let trace = record(&everything_scene(), MINUTE, every_mechanic);
+        let hero = World::from_level(&everything_scene()).hero_id();
+        let anchors = |tick: usize| -> Vec<crate::Anchor> {
+            let mut a: Vec<_> = trace[tick]
+                .tongues
+                .iter()
+                .map(|t| (t.slot, t.anchor))
+                .collect();
+            a.sort_by_key(|(slot, _)| *slot);
+            a.into_iter().map(|(_, anchor)| anchor).collect()
+        };
+
+        // The opening tap Attached to the Enemy itself rather than to the
+        // ceiling behind it, and the tension Threw it on the first tick the
+        // Tongue pulled.
+        let thrown = trace[0]
+            .bodies
+            .iter()
+            .map(|b| b.id)
+            .find(|id| *id != hero)
+            .expect("the scene has a hero and Enemies");
+        assert_eq!(
+            anchors(11),
+            vec![crate::Anchor::Movable(thrown)],
+            "the opening tap must Attach to the high Enemy"
+        );
+        assert_eq!(
+            trace[11].body(thrown).map(|b| b.kind),
+            Some(crate::BodyKind::Thrown),
+            "the Attach must Throw it outright"
+        );
+
+        // And the second tap, aimed straight through that Thrown Enemy, took
+        // the ceiling behind it: ADR-0015 in a trace, and the three-body phase
+        // ADR-0003 describes.
+        let braced = anchors(41);
+        assert!(
+            braced.len() == 2
+                && braced
+                    .iter()
+                    .any(|a| matches!(a, crate::Anchor::Movable(_)))
+                && braced.iter().any(|a| matches!(a, crate::Anchor::Fixed(_))),
+            "the three-body phase needs one Movable Anchor and one Fixed, got {braced:?}"
+        );
+
+        // ADR-0011's mutual row: two bodies leave on one tick, one of them a
+        // weapon and one a target, and the slot leaves with them.
+        let counts: Vec<usize> = trace.iter().map(|s| s.bodies.len()).collect();
+        let both = counts
+            .windows(2)
+            .position(|w| w[1] + 2 == w[0])
+            .map(|i| i + 1)
+            .expect("two bodies must leave on one tick");
+        let kinds: Vec<crate::BodyKind> = trace[both - 1].bodies.iter().map(|b| b.kind).collect();
+        assert!(
+            kinds.contains(&crate::BodyKind::Thrown) && kinds.contains(&crate::BodyKind::Enemy),
+            "the strike must be a weapon against a target, got {kinds:?}"
+        );
+        assert!(
+            !anchors(both)
+                .iter()
+                .any(|a| matches!(a, crate::Anchor::Movable(_))),
+            "the dead Anchor's slot must be swept free on the same tick: {:?}",
+            anchors(both)
+        );
+
+        // The repeating phase really fires and really Releases, rather than
+        // leaving one Tongue Attached for the whole minute. A Release is a
+        // Tongue leaving on a tick nothing died on, which is what distinguishes
+        // it from ADR-0014's sweep.
+        let releases = (1..trace.len())
+            .filter(|t| {
+                trace[*t].tongues.len() < trace[*t - 1].tongues.len()
+                    && counts[*t] == counts[*t - 1]
+            })
+            .count();
+        let fires = (1..trace.len())
+            .filter(|t| trace[*t].tongues.len() > trace[*t - 1].tongues.len())
+            .count();
+        assert!(
+            releases >= 8 && fires >= 8,
+            "the repeating phase must keep firing and Releasing: {fires} fires, \
+             {releases} Releases"
+        );
+
+        // Both kinds of Anchor appear among those later fires, which is what
+        // the three-aim cycle is for: with two aims they all came out the same.
+        let later: Vec<crate::Anchor> = (300..trace.len())
+            .flat_map(|t| trace[t].tongues.iter().map(|x| x.anchor))
+            .collect();
+        assert!(
+            later.iter().any(|a| matches!(a, crate::Anchor::Movable(_)))
+                && later.iter().any(|a| matches!(a, crate::Anchor::Fixed(_))),
+            "the repeating phase must reach both a Movable Anchor and a Fixed one"
+        );
+
+        // A Slam landed and a Combo rose and broke, so the impact bands and the
+        // Combo are in this trace and not only in `slam_run` and `combo_run`.
+        let combo: Vec<u32> = trace.iter().map(|s| s.combo).collect();
+        let peak = combo.iter().copied().max().expect("a trace is never empty");
+        assert!(peak >= 1, "no Slam landed in the whole run");
+        assert!(
+            combo.windows(2).any(|w| w[1] < w[0]),
+            "the Combo never broke, so coming to rest is untested here"
+        );
+
+        // The stray third finger disturbed nothing. Ten frames of a fresh id
+        // every frame, with the slots unchanged either side of them.
+        assert_eq!(
+            anchors(59),
+            anchors(70),
+            "a third finger disturbed a slot while two Tongues were held"
+        );
+
+        // And nothing anywhere in the run went non-finite, which is the failure
+        // an energy bound would catch late and this catches at the tick.
+        for (t, snapshot) in trace.iter().enumerate() {
+            for body in &snapshot.bodies {
+                assert!(
+                    body.pos.is_finite() && body.facing.is_finite(),
+                    "tick {t}: {body:?} went non-finite"
+                );
+            }
+        }
     }
 
     #[test]
