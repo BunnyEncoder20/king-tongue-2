@@ -284,6 +284,11 @@ pub fn run() {
         // more than ADR-0006 can use.
         let mut touches: Vec<sim::TouchSample> = Vec::with_capacity(10);
 
+        // The desktop harness's only state: what the mouse looked like last
+        // frame, which is what makes a press distinguishable from a hold.
+        #[cfg(not(target_os = "android"))]
+        let mut mouse = MouseFrame::default();
+
         // The Camera origin a touch is converted through is the one that was on
         // screen when the finger landed, which is last frame's. That is the
         // honest answer rather than a convenience: the player aimed at what
@@ -304,6 +309,12 @@ pub fn run() {
             // raw. A Tongue fired now appears in the Snapshot the next Sim Tick
             // writes, so it is drawn from the first tick it exists for.
             collect_touches(origin, &mut touches);
+            // The desktop harness, appended to the same set so the Core Sim
+            // cannot tell a mouse from a finger. Compiled out on Android.
+            #[cfg(not(target_os = "android"))]
+            {
+                mouse = append_mouse_touches(origin, mouse, &mut touches);
+            }
             world.apply_touches(&touches);
 
             for _ in 0..ticks {
@@ -365,5 +376,325 @@ pub fn collect_touches(origin: macroquad::math::Vec2, out: &mut Vec<sim::TouchSa
             },
             pos: from_screen(touch.position, origin),
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The desktop mouse harness.
+//
+// Compiled out on Android, so the shipping library cannot carry it. This exists
+// to make the Swing playable by hand on a desktop, which is the only way the
+// feel of ADR-0003's spring has ever been judged, and it is a harness rather
+// than a control scheme: ADR-0006's real input is two fingers on glass.
+// ---------------------------------------------------------------------------
+
+/// How many mouse buttons drive Tongues, and so how many touch ids exist.
+///
+/// Two, because two concurrent Gestures are the whole point. A Gesture claims
+/// the lowest slot no other finger is driving and `Gestures::claim` returns
+/// nothing for an id that already owns one, so a single button returns to slot 0
+/// forever and alternates fire, Release, fire. One button cannot hold two
+/// Tongues however fast it is tapped.
+#[cfg(not(target_os = "android"))]
+pub const MOUSE_POINTERS: usize = 2;
+
+/// Fails the build if the harness could ever drive more pointers than there are
+/// slots. If `MAX_TONGUES` grows, this harness covers only the first two and
+/// wants extending rather than trusting.
+#[cfg(not(target_os = "android"))]
+const _: () = assert!(MOUSE_POINTERS <= sim::MAX_TONGUES);
+
+/// The touch id each mouse button drives, stable for the whole run.
+///
+/// Stability is load-bearing rather than tidy. Slot ownership is keyed on id, so
+/// an id that changed while its button was held would read as a fresh `Started`
+/// every frame and re-fire the Tongue continuously.
+#[cfg(not(target_os = "android"))]
+const MOUSE_IDS: [u64; MOUSE_POINTERS] = [0, 1];
+
+/// Which mouse buttons were down when a frame was polled.
+#[cfg(not(target_os = "android"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MouseButtons {
+    /// Drives touch id 0.
+    pub left: bool,
+    /// Drives touch id 1.
+    pub right: bool,
+}
+
+/// What the previous frame's mouse looked like, which is all the state a phase
+/// decision needs.
+///
+/// Screen positions rather than world ones, because a phase is a screen-space
+/// question: a finger held still while the Camera follows the hero is
+/// `Stationary`, even though the world point under it moves every frame.
+#[cfg(not(target_os = "android"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MouseFrame {
+    held: [Option<macroquad::math::Vec2>; MOUSE_POINTERS],
+}
+
+/// Maps this frame's mouse into [`sim::TouchSample`]s, and returns the state the
+/// next frame needs.
+///
+/// Pure: it calls nothing from Macroquad, reads no global, and consults no
+/// clock. Every transition is therefore reachable without a window, which is
+/// what lets the first tests in this crate run headless.
+///
+/// The phase contract, per frame and per button:
+///
+/// - **Press** is `Started`, for exactly one frame.
+/// - **Held** is `Stationary`, or `Moved` only when the screen position changed.
+/// - **Release** is `Ended` for exactly one frame, after which the id is absent.
+///
+/// `Ended` is self-limiting rather than counted: a released button records no
+/// held position, so the following frame sees neither a previous position nor a
+/// button down and emits nothing at all.
+///
+/// Note what is deliberately absent. **Lifting a button does not Release a
+/// Tongue.** Pressing again does, because a Gesture on an occupied slot is a
+/// Release under ADR-0006. `Ended` must never be read as a Release anywhere:
+/// Macroquad flips every live touch to `Ended` when the app minimizes, so that
+/// reading would hand the player a free Release on every suspend.
+#[cfg(not(target_os = "android"))]
+pub fn mouse_to_touches(
+    buttons: MouseButtons,
+    position: macroquad::math::Vec2,
+    origin: macroquad::math::Vec2,
+    previous: MouseFrame,
+) -> ([Option<sim::TouchSample>; MOUSE_POINTERS], MouseFrame) {
+    let down = [buttons.left, buttons.right];
+    let mut samples = [None, None];
+    let mut next = MouseFrame::default();
+
+    for slot in 0..MOUSE_POINTERS {
+        let phase = match (previous.held[slot], down[slot]) {
+            (None, true) => Some(sim::TouchPhase::Started),
+            (Some(before), true) => Some(if before == position {
+                sim::TouchPhase::Stationary
+            } else {
+                sim::TouchPhase::Moved
+            }),
+            (Some(_), false) => Some(sim::TouchPhase::Ended),
+            (None, false) => None,
+        };
+
+        samples[slot] = phase.map(|phase| sim::TouchSample {
+            id: MOUSE_IDS[slot],
+            phase,
+            pos: from_screen(position, origin),
+        });
+
+        next.held[slot] = down[slot].then_some(position);
+    }
+
+    (samples, next)
+}
+
+/// Polls the mouse and appends its pointers to this frame's touch set.
+///
+/// The impure half, kept as thin as it can be so everything decidable lives in
+/// [`mouse_to_touches`].
+///
+/// A button counts as down if it is held **or** was pressed this frame. The
+/// second half matters: a click that goes down and up inside one frame is
+/// invisible to down-polling alone, and a dropped click is exactly what a player
+/// does to fire a Tongue. Including the press event makes that click a one frame
+/// `Started` followed by an `Ended`, which is what a real quick tap produces.
+#[cfg(not(target_os = "android"))]
+fn append_mouse_touches(
+    origin: macroquad::math::Vec2,
+    previous: MouseFrame,
+    out: &mut Vec<sim::TouchSample>,
+) -> MouseFrame {
+    use macroquad::input::{is_mouse_button_down, is_mouse_button_pressed, MouseButton};
+
+    let buttons = MouseButtons {
+        left: is_mouse_button_down(MouseButton::Left) || is_mouse_button_pressed(MouseButton::Left),
+        right: is_mouse_button_down(MouseButton::Right)
+            || is_mouse_button_pressed(MouseButton::Right),
+    };
+    let (x, y) = macroquad::input::mouse_position();
+    let (samples, next) =
+        mouse_to_touches(buttons, macroquad::math::Vec2::new(x, y), origin, previous);
+    out.extend(samples.into_iter().flatten());
+    next
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod tests {
+    use super::*;
+    use macroquad::math::Vec2 as Screen;
+
+    /// A Camera origin that is not the identity, so a test that confused screen
+    /// and world coordinates cannot pass by them being equal.
+    const ORIGIN: Screen = Screen::new(400.0, 300.0);
+
+    fn press(
+        buttons: MouseButtons,
+        at: Screen,
+        previous: MouseFrame,
+    ) -> (Vec<sim::TouchSample>, MouseFrame) {
+        let (samples, next) = mouse_to_touches(buttons, at, ORIGIN, previous);
+        (samples.into_iter().flatten().collect(), next)
+    }
+
+    const LEFT: MouseButtons = MouseButtons {
+        left: true,
+        right: false,
+    };
+    const RIGHT: MouseButtons = MouseButtons {
+        left: false,
+        right: true,
+    };
+    const BOTH: MouseButtons = MouseButtons {
+        left: true,
+        right: true,
+    };
+    const NONE: MouseButtons = MouseButtons {
+        left: false,
+        right: false,
+    };
+
+    #[test]
+    fn a_press_starts_once_and_then_holds_still() {
+        let at = Screen::new(464.0, 300.0);
+
+        let (first, state) = press(LEFT, at, MouseFrame::default());
+        assert_eq!(first.len(), 1, "one button down is one touch");
+        assert_eq!(first[0].id, 0, "the left button drives id 0");
+        assert_eq!(first[0].phase, sim::TouchPhase::Started);
+
+        // The claim this test exists for: Started happens once. A second
+        // Started while held would re-fire the Tongue every frame.
+        let (second, state) = press(LEFT, at, state);
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0].phase,
+            sim::TouchPhase::Stationary,
+            "a held button is Stationary, never Started again"
+        );
+
+        let (third, _) = press(LEFT, at, state);
+        assert_eq!(third[0].phase, sim::TouchPhase::Stationary);
+    }
+
+    #[test]
+    fn a_held_button_moves_only_when_the_pointer_does() {
+        let at = Screen::new(464.0, 300.0);
+        let (_, state) = press(LEFT, at, MouseFrame::default());
+
+        let moved_to = Screen::new(465.0, 300.0);
+        let (moved, state) = press(LEFT, moved_to, state);
+        assert_eq!(moved[0].phase, sim::TouchPhase::Moved);
+
+        // Still at the new position, so back to Stationary rather than staying
+        // Moved. Comparing against the previous frame and not the press point.
+        let (still, _) = press(LEFT, moved_to, state);
+        assert_eq!(still[0].phase, sim::TouchPhase::Stationary);
+    }
+
+    #[test]
+    fn a_release_ends_for_exactly_one_frame_and_then_nothing() {
+        let at = Screen::new(464.0, 300.0);
+        let (_, state) = press(LEFT, at, MouseFrame::default());
+
+        let (ended, state) = press(NONE, at, state);
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].phase, sim::TouchPhase::Ended);
+        assert_eq!(ended[0].id, 0);
+
+        // The half that a counter would get wrong: the frame after Ended is
+        // empty, not another Ended.
+        let (after, state) = press(NONE, at, state);
+        assert!(
+            after.is_empty(),
+            "a lifted button reports nothing, got {after:?}"
+        );
+        let (later, _) = press(NONE, at, state);
+        assert!(later.is_empty());
+    }
+
+    #[test]
+    fn both_buttons_hold_two_touches_at_once_which_is_the_only_route_to_the_second_slot() {
+        let at = Screen::new(464.0, 300.0);
+
+        let (both, state) = press(BOTH, at, MouseFrame::default());
+        assert_eq!(both.len(), 2, "two buttons down is two concurrent touches");
+        let ids: Vec<u64> = both.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![0, 1], "ascending, and left is 0");
+        assert!(both.iter().all(|s| s.phase == sim::TouchPhase::Started));
+
+        // Independent: letting the left go leaves the right held, which is what
+        // holding two Tongues and Releasing one looks like.
+        let (one_up, _) = press(RIGHT, at, state);
+        assert_eq!(one_up.len(), 2);
+        let left = one_up
+            .iter()
+            .find(|s| s.id == 0)
+            .expect("id 0 reports its lift");
+        let right = one_up
+            .iter()
+            .find(|s| s.id == 1)
+            .expect("id 1 is still held");
+        assert_eq!(left.phase, sim::TouchPhase::Ended);
+        assert_eq!(right.phase, sim::TouchPhase::Stationary);
+    }
+
+    #[test]
+    fn the_right_button_alone_drives_id_one_and_leaves_id_zero_absent() {
+        let at = Screen::new(464.0, 300.0);
+        let (only, _) = press(RIGHT, at, MouseFrame::default());
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].id, 1, "the right button drives id 1");
+        assert_eq!(only[0].phase, sim::TouchPhase::Started);
+    }
+
+    #[test]
+    fn an_id_is_stable_across_every_frame_it_is_held() {
+        let mut state = MouseFrame::default();
+        let mut seen = Vec::new();
+        for frame in 0..8 {
+            // Move every other frame, so the run covers Started, Moved and
+            // Stationary without the id ever changing.
+            let at = Screen::new(464.0 + (frame / 2) as f32, 300.0);
+            let (samples, next) = press(LEFT, at, state);
+            state = next;
+            seen.push(samples[0].id);
+        }
+        assert_eq!(
+            seen,
+            vec![0; 8],
+            "a held button keeps its id for its whole life"
+        );
+    }
+
+    #[test]
+    fn the_position_crosses_into_world_units_through_the_camera_origin() {
+        // One unit right of the origin is PIXELS_PER_UNIT screen pixels right,
+        // and screen y grows downward while world y grows upward.
+        let at = Screen::new(ORIGIN.x + PIXELS_PER_UNIT, ORIGIN.y - 2.0 * PIXELS_PER_UNIT);
+        let (samples, _) = press(LEFT, at, MouseFrame::default());
+
+        let pos = samples[0].pos;
+        assert!(
+            (pos - glam::Vec2::new(1.0, 2.0)).length() < 1e-6,
+            "expected world (1, 2), got {pos:?}"
+        );
+    }
+
+    #[test]
+    fn a_press_at_a_new_place_after_a_release_starts_rather_than_moves() {
+        let first = Screen::new(464.0, 300.0);
+        let (_, state) = press(LEFT, first, MouseFrame::default());
+        let (_, state) = press(NONE, first, state);
+
+        // The re-press is a fresh Gesture even though the pointer moved while
+        // the button was up, which is the case a stale held position would get
+        // wrong by reporting Moved and so firing nothing.
+        let elsewhere = Screen::new(600.0, 120.0);
+        let (again, _) = press(LEFT, elsewhere, state);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].phase, sim::TouchPhase::Started);
     }
 }
