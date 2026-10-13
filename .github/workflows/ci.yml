@@ -50,6 +50,18 @@ jobs:
       - name: Core Sim tests with serde and the ASCII test helper
         run: cargo test -p king_tongue_sim --features serde,test-util
 
+      # The Shell's own tests, which the four steps above do not reach because
+      # each is scoped to `-p king_tongue_sim`. Workspace clippy compiles these
+      # test targets but never runs them, so without this step the Shell's first
+      # tests would be built and silently never executed. That is the same shape
+      # as the crate-scoped clippy step that left the Shell's lints advisory for
+      # ten merges, so the step lands with the tests rather than after them.
+      #
+      # They are headless by construction: the mouse mapping is a pure function,
+      # so no window and no GL surface are involved.
+      - name: Shell tests
+        run: cargo test -p king_tongue_shell
+
       # A level file that stops parsing is a broken game, and it would
       # otherwise only surface by launching. ADR-0010.
       - name: Shipped level assets parse
